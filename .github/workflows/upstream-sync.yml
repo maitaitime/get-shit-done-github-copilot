@@ -1,0 +1,2010 @@
+# Upstream Sync + Release Mirror Workflow
+# Detects changes in upstream gsd-build/get-shit-done, merges them,
+# regenerates the Copilot wrapper layer, verifies it, and creates/updates a PR.
+# Also polls upstream for new releases and auto-publishes a matching fork release.
+#
+# One-time prerequisites (run once before first execution):
+#   gh label create upstream-sync --color 0075ca --description "Upstream sync PR" --repo <fork>
+#   gh label create automated --color e4e669 --description "Automated workflow" --repo <fork>
+#   gh label create upstream-mirror --color d93f0b --description "Upstream release mirror" --repo <fork>
+#   gh label create escalation --color d93f0b --description "Escalation required: autonomous maintenance dead-end" --repo <fork>
+#   Enable: Settings → General → Pull Requests → Allow auto-merge: ON
+#   Verify: COPILOT_PAT secret has 'repo' scope (required for tag push to trigger release.yml)
+#
+# Schedule: runs every 4 hours. Both sync and release-mirror jobs exit silently when nothing to do.
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'  # Every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
+  workflow_dispatch:
+  push:
+    branches:
+      - 'copilot/**'
+
+name: Upstream Sync
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  DEFAULT_BRANCH: main
+  EXPECTED_REPO: maitaitime/get-shit-done-github-copilot
+  UPSTREAM_BRANCH: main
+  UPSTREAM_REPO: gsd-build/get-shit-done
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    outputs:
+      security_flagged: ${{ steps.analyze_delta.outputs.security_flagged }}
+      has_new_commands: ${{ steps.analyze_delta.outputs.has_new_commands }}
+      no_changes: ${{ steps.detect.outputs.no_changes }}
+      short_sha: ${{ steps.detect.outputs.short_sha }}
+      merge_conflict: ${{ steps.merge.outputs.merge_conflict }}
+      merge_conflict_files: ${{ steps.merge.outputs.merge_conflict_files }}
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # SAFETY: Always run this assertion first. Add --repo "$GITHUB_REPOSITORY" to any new gh command you add here.
+      - name: Assert fork context
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "${{ env.EXPECTED_REPO }}" ]; then
+            echo "ERROR: This workflow is running on '$GITHUB_REPOSITORY' but is only intended to run on '${{ env.EXPECTED_REPO }}'."
+            echo "Refusing to proceed — this prevents accidental writes to the wrong repository."
+            exit 1
+          fi
+
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || true
+          git fetch upstream "${{ env.UPSTREAM_BRANCH }}"
+
+      - name: Detect upstream changes
+        id: detect
+        run: |
+          FORK_HEAD=$(git rev-parse HEAD)
+          UPSTREAM_HEAD=$(git rev-parse "upstream/${{ env.UPSTREAM_BRANCH }}")
+          SHORT_SHA=$(git rev-parse --short "upstream/${{ env.UPSTREAM_BRANCH }}")
+
+          echo "fork_head=$FORK_HEAD" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=$UPSTREAM_HEAD" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          # Check if upstream has commits not in fork HEAD
+          DIFF_COUNT=$(git rev-list HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --count)
+          if [ "$DIFF_COUNT" -eq 0 ]; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes detected. Exiting."
+          else
+            echo "no_changes=false" >> "$GITHUB_OUTPUT"
+            echo "Detected $DIFF_COUNT new upstream commit(s)."
+          fi
+
+      - name: Exit silently if no changes
+        if: steps.detect.outputs.no_changes == 'true'
+        run: exit 0
+
+      - name: Create/reset working branch
+        if: steps.detect.outputs.no_changes != 'true'
+        run: |
+          git checkout -B automated/upstream-sync origin/${{ env.DEFAULT_BRANCH }}
+
+      - name: Merge upstream changes
+        if: steps.detect.outputs.no_changes != 'true'
+        id: merge
+        run: |
+          echo "merge_conflict=false" >> "$GITHUB_OUTPUT"
+          CONFLICT_SHA="${{ steps.detect.outputs.short_sha }}"
+
+          # Ensure upstream-sync label exists
+          gh label create "upstream-sync" \
+            --color "0075ca" \
+            --description "Upstream sync automation" \
+            --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+          if git merge "upstream/${{ env.UPSTREAM_BRANCH }}" --no-edit; then
+            echo "Merge succeeded cleanly."
+
+            # Close any open conflict issue for this upstream SHA
+            OPEN_CONFLICT=$(gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --label "upstream-sync" \
+              --state open \
+              --search "\"Upstream sync merge conflict (upstream@${CONFLICT_SHA})\" in:title" \
+              --json number \
+              --jq '.[0].number' 2>/dev/null || echo "")
+            if [ -n "$OPEN_CONFLICT" ] && [ "$OPEN_CONFLICT" != "null" ]; then
+              echo "Closing resolved conflict issue #${OPEN_CONFLICT}..."
+              gh issue close "$OPEN_CONFLICT" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "Closed automatically: upstream@${CONFLICT_SHA} merged successfully in run ${{ github.run_id }}."
+            fi
+
+            exit 0
+          fi
+
+          echo "Merge conflict detected. Attempting auto-resolution by file ownership..."
+
+          # Guard: if there are no unmerged files, the failure was not conflict-related.
+          # Emit merge_conflict=false and abort so the repair job handles it as a generic failure.
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+          if [ -z "$CONFLICT_FILES" ]; then
+            echo "::error::git merge failed but no unmerged files detected — non-conflict merge failure."
+            exit 1
+          fi
+
+          # Fork-owned files: --ours always wins
+          FORK_OWNED_PATTERN="^(package\.json|README\.md|FORK-CHANGELOG\.md|AGENTS\.md|FUNDING\.yml|\.github/FUNDING\.yml|\.github/ISSUE_TEMPLATE/bug_report\.yml|\.github/workflows/[^/]+\.yml|\.github/prompts/.*|\.github/agents/.*|\.github/instructions/.*|\.github/copilot-instructions\.md|\.planning/.*)$"
+
+          for f in $CONFLICT_FILES; do
+            if echo "$f" | grep -qE "$FORK_OWNED_PATTERN"; then
+              echo "Auto-resolving (--ours): $f"
+              git checkout --ours "$f"
+              git add "$f"
+            elif [ "$f" = "CHANGELOG.md" ]; then
+              echo "Auto-resolving (--theirs): $f (upstream-owned)"
+              git checkout --theirs "$f"
+              git add "$f"
+            else
+              echo "Cannot auto-resolve: $f"
+            fi
+          done
+
+          REMAINING=$(git diff --name-only --diff-filter=U)
+
+          if [ -z "$REMAINING" ]; then
+            echo "All conflicts auto-resolved. Committing merge..."
+            git commit -m "chore: merge upstream/main (auto-resolved fork-owned conflicts)"
+            echo "merge_conflict=false" >> "$GITHUB_OUTPUT"
+
+            # Close any open conflict issue for this SHA — same logic as clean merge path
+            OPEN_CONFLICT=$(gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --label "upstream-sync" \
+              --state open \
+              --search "\"Upstream sync merge conflict (upstream@${CONFLICT_SHA})\" in:title" \
+              --json number \
+              --jq '.[0].number' 2>/dev/null || echo "")
+            if [ -n "$OPEN_CONFLICT" ] && [ "$OPEN_CONFLICT" != "null" ]; then
+              echo "Closing resolved conflict issue #${OPEN_CONFLICT}..."
+              gh issue close "$OPEN_CONFLICT" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "Closed automatically: upstream@${CONFLICT_SHA} auto-resolved in run ${{ github.run_id }}."
+            fi
+
+            exit 0
+          fi
+
+          echo "Unresolvable conflicts remain: $REMAINING"
+          echo "merge_conflict=true" >> "$GITHUB_OUTPUT"
+          CONFLICT_LIST=$(echo "$REMAINING" | tr '\n' ',' | sed 's/,$//')
+          echo "merge_conflict_files=${CONFLICT_LIST}" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Report merge conflict
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outputs.merge_conflict == 'true'
+        run: |
+          CONFLICT_SHA="${{ steps.detect.outputs.short_sha }}"
+
+          # Ensure upstream-sync label exists
+          gh label create "upstream-sync" \
+            --color "0075ca" \
+            --description "Upstream sync automation" \
+            --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+          # Dedup check: existing open issue for this SHA?
+          EXISTING_ISSUE=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "upstream-sync" \
+            --state open \
+            --search "\"Upstream sync merge conflict (upstream@${CONFLICT_SHA})\" in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          git diff --name-only --diff-filter=U > /tmp/conflict-files.txt
+
+          cat > /tmp/conflict-body.md << 'ISSUE_EOF'
+          ## Upstream Sync Merge Conflict
+
+          The automated upstream sync encountered a merge conflict that could not be auto-resolved.
+          ISSUE_EOF
+
+          cat >> /tmp/conflict-body.md << ISSUE_EOF
+
+          **Upstream commit:** ${{ steps.detect.outputs.short_sha }}
+          **Upstream HEAD:** ${{ steps.detect.outputs.upstream_head }}
+          **Fork HEAD (before merge):** ${{ steps.detect.outputs.fork_head }}
+          ISSUE_EOF
+
+          cat >> /tmp/conflict-body.md << 'ISSUE_EOF'
+
+          ### Conflicting files (not auto-resolvable)
+          ISSUE_EOF
+          cat /tmp/conflict-files.txt | sed 's/^/- /' >> /tmp/conflict-body.md
+          cat >> /tmp/conflict-body.md << ISSUE_EOF
+
+          The repair agent will attempt to resolve this. If it cannot, an escalation issue will be filed separately.
+
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ISSUE_EOF
+
+          if [ -n "$EXISTING_ISSUE" ] && [ "$EXISTING_ISSUE" != "null" ]; then
+            echo "Conflict issue #${EXISTING_ISSUE} already open. Appending comment."
+            gh issue comment "$EXISTING_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file /tmp/conflict-body.md
+          else
+            echo "Creating new conflict issue..."
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Upstream sync merge conflict (upstream@${CONFLICT_SHA})" \
+              --body-file /tmp/conflict-body.md \
+              --label "upstream-sync"
+          fi
+
+      - name: Analyze upstream delta
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        id: analyze_delta
+        run: |
+          FORK_HEAD="${{ steps.detect.outputs.fork_head }}"
+          UPSTREAM_HEAD="${{ steps.detect.outputs.upstream_head }}"
+
+          # Structural diff — what files changed in upstream-owned dirs
+          STRUCT_DIFF=$(git diff --name-status "$FORK_HEAD" "$UPSTREAM_HEAD" \
+            -- commands/gsd/ agents/ get-shit-done/ 2>/dev/null || echo "")
+
+          # Upstream commit log
+          UPSTREAM_LOG=$(git log --oneline "$FORK_HEAD..upstream/${{ env.UPSTREAM_BRANCH }}" 2>/dev/null || echo "(none)")
+
+          # Detect new commands (status A = Added) in commands/gsd/
+          NEW_COMMANDS=$(echo "$STRUCT_DIFF" | awk '$1=="A"{print $2}' | grep 'commands/gsd/' || echo "")
+          if [ -n "$NEW_COMMANDS" ]; then
+            echo "has_new_commands=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_new_commands=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Detect new agents
+          NEW_AGENTS=$(echo "$STRUCT_DIFF" | awk '$1=="A"{print $2}' | grep 'agents/' || echo "")
+
+          # Security scan: YAML files only (avoids false positives on doc lines)
+          YAML_DIFF=$(git diff "$FORK_HEAD" "$UPSTREAM_HEAD" -- "*.yml" "*.yaml" 2>/dev/null || echo "")
+          SECURITY_HITS=$(echo "$YAML_DIFF" | \
+            grep -E "^[+-].*\b(GITHUB_TOKEN|secrets\.|permissions:|token:|auth:)\b" | \
+            grep -v "^---\|^+++" | head -20 || echo "")
+          if [ -n "$SECURITY_HITS" ]; then
+            echo "security_flagged=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Security-sensitive upstream YAML changes detected. Auto-merge will be blocked."
+          else
+            echo "security_flagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Content diff of upstream dirs (truncated to 30k chars for agent context)
+          CONTENT_DIFF=$(git diff "$FORK_HEAD" "$UPSTREAM_HEAD" \
+            -- commands/gsd/ agents/ get-shit-done/ 2>/dev/null | head -c 30000 || echo "")
+
+          # Write structured analysis to /tmp for downstream consumption
+          cat > /tmp/delta-analysis.md << 'DELIM'
+          ## Upstream Delta Analysis
+          DELIM
+
+          cat >> /tmp/delta-analysis.md << DELIM
+          **Upstream commits:**
+          \`\`\`
+          ${UPSTREAM_LOG}
+          \`\`\`
+
+          **Structural changes (upstream-owned dirs):**
+          \`\`\`
+          ${STRUCT_DIFF:-"(none)"}
+          \`\`\`
+
+          **New commands detected:** ${NEW_COMMANDS:-"(none)"}
+          **New agents detected:** ${NEW_AGENTS:-"(none)"}
+          **Security-sensitive YAML lines:** ${SECURITY_HITS:-"(none)"}
+
+          **Content diff (truncated to 30k chars):**
+          \`\`\`diff
+          ${CONTENT_DIFF:-"(none)"}
+          \`\`\`
+          DELIM
+
+          echo "Delta analysis written to /tmp/delta-analysis.md"
+
+          # Write full analysis to workflow step summary
+          echo "## Upstream Delta Analysis (upstream@${{ steps.detect.outputs.short_sha }})" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/delta-analysis.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Proactive fork adaptation
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        id: proactive_adapt
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          # Skip gracefully if COPILOT_PAT is not set
+          if [ -z "$GH_TOKEN" ]; then
+            echo "COPILOT_PAT not configured — skipping proactive adaptation."
+            echo "proactive_adapt_invoked=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          DELTA_ANALYSIS=$(cat /tmp/delta-analysis.md 2>/dev/null || echo "(delta analysis unavailable)")
+          HAS_NEW_COMMANDS="${{ steps.analyze_delta.outputs.has_new_commands }}"
+
+          # Build gap-filling addendum if new commands/agents detected
+          GAP_INSTRUCTIONS=""
+          if [ "${HAS_NEW_COMMANDS}" = "true" ]; then
+            GAP_INSTRUCTIONS="
+          ## Coverage Gap Filling (REQUIRED)
+
+          New upstream commands or agents were detected with no fork equivalents.
+          For each new file listed under 'New commands detected' or 'New agents detected' in the delta analysis above:
+          1. Create a corresponding wrapper prompt in .github/prompts/ following the exact format of existing prompts.
+          2. Run node scripts/verify-prompts.mjs after creating wrappers to confirm coverage.
+          3. If scripts/verify-prompts.mjs reports any 'missing prompt' errors, fix them before finishing.
+          "
+          fi
+
+          cat > /tmp/proactive_prompt.md << PROMPT_EOF
+          You are the GSD upstream-sync proactive adaptation agent. An upstream merge just landed. Analyze the delta below and make ALL required changes to keep the fork's compatibility layer working correctly.
+
+          ## Authority — what you MAY modify
+          - scripts/generate-prompts.mjs
+          - scripts/verify-prompts.mjs
+          - scripts/tools.json
+          - .github/workflows/upstream-sync.yml
+          - .github/prompts/**
+          - .github/agents/**
+          - .github/instructions/**
+          - README.md
+          - FORK-CHANGELOG.md
+          - AGENTS.md
+
+          ## Hard limit — NEVER modify
+          - commands/gsd/**
+          - agents/**
+          - get-shit-done/**
+
+          ## Required outcome
+          1. Make any pre-emptive changes needed based on the upstream delta (e.g., if upstream added a new frontmatter field, update generate-prompts.mjs to handle it).
+          2. Run: node scripts/generate-prompts.mjs && node scripts/verify-prompts.mjs
+          3. Both must pass.
+          4. Open a PR targeting branch: automated/upstream-sync
+          5. Write a descriptive commit message explaining WHAT you changed and WHY.
+          6. If you determine that no changes are needed (everything already works), make no commits.
+          7. If you determine this problem requires human input, write "DEAD_END" to /tmp/repair-dead-end.txt and stop.
+
+          ${GAP_INSTRUCTIONS}
+
+          ## Upstream Delta Analysis
+          ${DELTA_ANALYSIS}
+          PROMPT_EOF
+
+          # Trigger Copilot coding agent via issue assignment.
+          # gh agent-task create cannot be used in CI — it requires an interactive
+          # OAuth token (browser/device flow) regardless of PAT scopes.
+          # In this repository, we trigger the Copilot coding agent by creating a
+          # GitHub issue assigned to 'copilot'; when enabled, the agent should pick
+          # it up and open a copilot/* PR. This behavior depends on repository
+          # Trigger Copilot coding agent via issue assignment.
+          # Issue is created first (no assignee) to guarantee the issue exists
+          # and the prompt is captured even if Copilot assignment fails.
+          # Assignment is attempted separately so the real API error is visible.
+          echo "Creating Copilot adaptation issue..."
+          ADAPT_ISSUE_URL=$(gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "adapt(upstream-sync): proactive fork adaptation [$(date -u +%Y-%m-%dT%H:%M)]" \
+            --body-file /tmp/proactive_prompt.md \
+            --label "upstream-sync" \
+            2>&1) || true
+          echo "gh issue create output: $ADAPT_ISSUE_URL"
+          ADAPT_ISSUE=$(echo "$ADAPT_ISSUE_URL" | grep -oP '/issues/\K[0-9]+' || echo "")
+          [[ "$ADAPT_ISSUE" =~ ^[0-9]+$ ]] || ADAPT_ISSUE=""
+
+          if [ -z "$ADAPT_ISSUE" ]; then
+            echo "::warning::Failed to create Copilot adaptation issue (see output above)."
+            echo "proactive_adapt_invoked=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Assigning Copilot coding agent to issue #${ADAPT_ISSUE}..."
+          ASSIGN_OUT=$(gh issue edit "$ADAPT_ISSUE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --add-assignee "Copilot" \
+            2>&1) || true
+          echo "gh issue edit (assignee) output: $ASSIGN_OUT"
+
+          ISSUE_CREATED_AT=$(gh issue view "$ADAPT_ISSUE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json createdAt \
+            --jq '.createdAt' 2>/dev/null || echo "")
+
+          if [ -z "$ISSUE_CREATED_AT" ]; then
+            echo "::warning::Failed to retrieve creation time for issue #${ADAPT_ISSUE}. Proceeding without PR association filter."
+          fi
+
+          echo "Created issue #${ADAPT_ISSUE}. Waiting up to 20 minutes for Copilot coding agent to open a PR..."
+          POLL_MAX=24
+          POLL_COUNT=0
+          ADAPT_PR=""
+          while [ $POLL_COUNT -lt $POLL_MAX ]; do
+            if [ -n "$ISSUE_CREATED_AT" ]; then
+              export ISSUE_CREATED_AT
+              ADAPT_PR=$(gh pr list \
+                --repo "$GITHUB_REPOSITORY" \
+                --base "automated/upstream-sync" \
+                --state open \
+                --json number,headRefName,createdAt \
+                --jq '.[] | select((.headRefName | startswith("copilot/")) and (.createdAt >= env.ISSUE_CREATED_AT)) | .number' \
+                2>/dev/null | head -1 || echo "")
+            else
+              ADAPT_PR=$(gh pr list \
+                --repo "$GITHUB_REPOSITORY" \
+                --base "automated/upstream-sync" \
+                --state open \
+                --json number,headRefName \
+                --jq '.[] | select(.headRefName | startswith("copilot/")) | .number' \
+                2>/dev/null | head -1 || echo "")
+            fi
+            if [ -n "$ADAPT_PR" ]; then
+              echo "Copilot PR #${ADAPT_PR} found after ~$((POLL_COUNT * 50))s."
+              break
+            fi
+            sleep 50
+            POLL_COUNT=$((POLL_COUNT + 1))
+          done
+
+          if [ -n "${ADAPT_PR:-}" ]; then
+            gh issue close "$ADAPT_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --comment "Processed by upstream-sync proactive adaptation step." \
+              2>/dev/null || true
+          else
+            echo "::warning::Copilot coding agent did not open a PR within 20 minutes. Leaving issue #${ADAPT_ISSUE} open."
+          fi
+
+          echo "proactive_adapt_invoked=true" >> "$GITHUB_OUTPUT"
+
+      - name: Merge Copilot adaptation branch
+        if: >
+          steps.detect.outputs.no_changes != 'true' &&
+          steps.merge.outcome == 'success' &&
+          steps.proactive_adapt.outputs.proactive_adapt_invoked == 'true'
+        id: merge_copilot_adapt
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          # Find open PR from copilot/* branch targeting automated/upstream-sync
+          COPILOT_PR=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "automated/upstream-sync" \
+            --state open \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("copilot/")) | .number' \
+            2>/dev/null | head -1 || echo "")
+
+          if [ -z "$COPILOT_PR" ]; then
+            echo "No copilot/* PR found targeting automated/upstream-sync. No merge-back needed."
+            echo "copilot_merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found Copilot adaptation PR #${COPILOT_PR}. Merging into automated/upstream-sync..."
+
+          # Get the head ref name
+          COPILOT_BRANCH=$(gh pr view "$COPILOT_PR" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json headRefName \
+            --jq '.headRefName' 2>/dev/null || echo "")
+
+          if [ -n "$COPILOT_BRANCH" ]; then
+            git fetch origin "$COPILOT_BRANCH" 2>/dev/null || true
+            git merge "origin/$COPILOT_BRANCH" --no-edit --allow-unrelated-histories 2>/dev/null || true
+
+            # Close the copilot/* PR since we merged it directly
+            gh pr close "$COPILOT_PR" \
+              --repo "$GITHUB_REPOSITORY" \
+              --comment "Merged into automated/upstream-sync directly by upstream-sync workflow." \
+              || true
+
+            echo "copilot_merged=true" >> "$GITHUB_OUTPUT"
+            echo "Copilot adaptation branch merged successfully."
+          else
+            echo "::warning::Could not determine copilot branch name for PR #${COPILOT_PR}."
+            echo "copilot_merged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run prompt generator
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        run: |
+          node scripts/generate-prompts.mjs > /tmp/gen_output.txt 2>&1
+          echo "Generator output:"
+          cat /tmp/gen_output.txt
+
+      - name: Run prompt verifier
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        id: verify
+        run: |
+          if ! node scripts/verify-prompts.mjs > /tmp/ver_output.txt 2>&1; then
+            cat > /tmp/issue-body.md << 'ISSUE_EOF'
+          ## Upstream Sync Verifier Failure
+
+          The upstream sync completed merge and regeneration, but the verifier failed. No PR was created.
+
+          **Upstream commit:** ${{ steps.detect.outputs.short_sha }}
+          **Upstream HEAD:** ${{ steps.detect.outputs.upstream_head }}
+
+          ### Generator output
+          ```
+          ISSUE_EOF
+            cat /tmp/gen_output.txt >> /tmp/issue-body.md
+            cat >> /tmp/issue-body.md << 'ISSUE_EOF'
+          ```
+
+          ### Verifier output
+          ```
+          ISSUE_EOF
+            cat /tmp/ver_output.txt >> /tmp/issue-body.md
+            cat >> /tmp/issue-body.md << 'ISSUE_EOF'
+          ```
+
+          ### Resolution steps
+          1. Review the verifier errors above
+          2. Fix `scripts/generate-prompts.mjs` or `scripts/verify-prompts.mjs` as needed (do NOT edit upstream content)
+          3. Re-run workflow or fix and push manually
+
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ISSUE_EOF
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Upstream sync verifier failed (upstream@${{ steps.detect.outputs.short_sha }})" \
+              --body-file /tmp/issue-body.md \
+              --label "upstream-sync"
+            exit 1
+          fi
+          echo "Verifier passed."
+          cat /tmp/ver_output.txt
+
+      - name: Commit regenerated wrapper files
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        run: |
+          git add --all .github/prompts/ 2>/dev/null || true
+          git add --all .github/agents/ 2>/dev/null || true
+          git add --all .github/instructions/ 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: regenerate Copilot wrapper layer for upstream@${{ steps.detect.outputs.short_sha }}"
+          else
+            echo "No wrapper file changes to commit."
+          fi
+
+      # SYNC-03: Close any open PRs for automated/upstream-sync before force-pushing so the
+      # replacement PR always reflects the current branch state cleanly.
+      - name: Close superseded sync PRs
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        run: |
+          OPEN_PRS=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "automated/upstream-sync" \
+            --state open \
+            --json number \
+            --jq '.[].number' 2>/dev/null || echo "")
+
+          for PR_NUM in $OPEN_PRS; do
+            gh pr comment "$PR_NUM" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "Closing — superseded by a new upstream sync run (upstream@${{ steps.detect.outputs.short_sha }}). A fresh PR will be created for this run."
+            gh pr close "$PR_NUM" \
+              --repo "$GITHUB_REPOSITORY"
+            echo "Closed stale PR #${PR_NUM}."
+          done
+
+      - name: Force-push working branch
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        run: |
+          git push --force-with-lease origin automated/upstream-sync
+
+      - name: Check open escalations
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        id: check_escalations
+        run: |
+          OPEN_COUNT=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "escalation" \
+            --state open \
+            --json number \
+            --jq 'length' 2>/dev/null || echo "0")
+
+          if [ "$OPEN_COUNT" -gt 0 ]; then
+            echo "has_escalation=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::${OPEN_COUNT} open escalation issue(s) found. Auto-merge will be blocked on this sync."
+          else
+            echo "has_escalation=false" >> "$GITHUB_OUTPUT"
+            echo "No open escalation issues."
+          fi
+
+      - name: Build PR body
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        run: |
+          NOTIFY="${{ vars.NOTIFY_MAINTAINER }}"
+          # Default: tag the user unless NOTIFY_MAINTAINER explicitly set to "false"
+          TAG_LINE=""
+          TAG_NOTE=""
+          if [ "${NOTIFY:-true}" != "false" ]; then
+            TAG_LINE="cc @dwisner — substantive adaptations were made autonomously."
+            TAG_NOTE="To disable maintainer tagging, set repository variable \`NOTIFY_MAINTAINER\` to \`false\` at: Settings → Secrets and variables → Actions → Variables tab."
+          fi
+
+          # Read runtime files (truncate to avoid 65k body limit)
+          DELTA_ANALYSIS=$(cat /tmp/delta-analysis.md 2>/dev/null | head -c 3000 || echo "(not available)")
+          ADAPTATIONS=$(cat /tmp/adaptations-summary.md 2>/dev/null | head -c 2000 || echo "(proactive adaptation step did not run or made no changes)")
+          RANGE="${{ steps.detect.outputs.fork_head }}...${{ steps.detect.outputs.upstream_head }}"
+
+          # Determine coverage gaps section
+          HAS_NEW_COMMANDS="${{ steps.analyze_delta.outputs.has_new_commands }}"
+          if [ "${HAS_NEW_COMMANDS}" = "true" ]; then
+            GAPS_SECTION="New upstream commands/agents were detected. The proactive adaptation agent was instructed to create wrapper prompts. See Fork adaptations section for details."
+          else
+            GAPS_SECTION="No new upstream commands or agents detected."
+          fi
+
+          # Determine security section for open issues
+          SECURITY_FLAGGED="${{ steps.analyze_delta.outputs.security_flagged }}"
+          OPEN_ISSUES_SECTION=""
+          if [ "${SECURITY_FLAGGED}" = "true" ]; then
+            OPEN_ISSUES_SECTION="⚠️ **Security-sensitive upstream YAML changes detected.** Auto-merge was blocked. Review the delta analysis above before merging."
+          fi
+
+          cat > /tmp/pr-body.md << PR_EOF
+          ## Upstream sync from \`gsd-build/get-shit-done\`
+
+          **Upstream commit:** \`${{ steps.detect.outputs.short_sha }}\`
+          **Commit range:** \`${RANGE}\`
+
+          ---
+
+          ### 📥 Upstream changes
+
+          ${DELTA_ANALYSIS}
+
+          ---
+
+          ### 🔧 Fork adaptations
+
+          ${ADAPTATIONS}
+
+          ---
+
+          ### 🆕 Coverage gaps filled
+
+          ${GAPS_SECTION}
+
+          ---
+
+          ### ✅ No action needed
+
+          Generator and verifier passed. Wrapper layer regenerated automatically.
+
+          ---
+
+          ### 🚨 Open issues
+
+          ${OPEN_ISSUES_SECTION:-"None detected on this run."}
+
+          ---
+
+          ${TAG_LINE}
+          ${TAG_NOTE}
+
+          *This PR was created automatically. [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+          PR_EOF
+
+      # SYNC-01/02: Create (or update) the PR and immediately enable auto-merge so it lands on
+      # main without manual intervention as soon as required checks pass.
+      # Prerequisite: Settings → General → Pull Requests → "Allow auto-merge" must be ON.
+      - name: Create or update PR
+        if: steps.detect.outputs.no_changes != 'true' && steps.merge.outcome == 'success'
+        id: create_pr
+        run: |
+          SHORT_SHA="${{ steps.detect.outputs.short_sha }}"
+          PR_TITLE="sync: upstream changes from ${SHORT_SHA}"
+
+          # After the close-stale step, there should be no open PR, but guard defensively.
+          EXISTING_PR=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "automated/upstream-sync" \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING_PR" ]; then
+            PR_URL=$(gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "${{ env.DEFAULT_BRANCH }}" \
+              --head "automated/upstream-sync" \
+              --title "${PR_TITLE}" \
+              --body-file /tmp/pr-body.md \
+              --label "upstream-sync" \
+              --label "automated")
+            echo "Created new PR: ${PR_URL}"
+            PR_NUMBER=$(basename "$PR_URL")
+            echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            gh pr edit "$EXISTING_PR" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${PR_TITLE}" \
+              --body-file /tmp/pr-body.md
+            echo "Updated existing PR #${EXISTING_PR}."
+            echo "pr_number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # SYNC-01/02: Enable auto-merge on the PR (merge commit strategy preserves upstream commit SHAs
+      # in main's ancestry, which is required for GitHub's 'X commits behind upstream' indicator to
+      # clear correctly after merge. Squash would create a new SHA and main would always appear behind.)
+      # This is a no-op when auto-merge is already enabled; safe to run on every sync.
+      - name: Enable auto-merge on sync PR
+        if: >
+          steps.detect.outputs.no_changes != 'true' &&
+          steps.merge.outcome == 'success' &&
+          steps.create_pr.outputs.pr_number != '' &&
+          steps.check_escalations.outputs.has_escalation != 'true' &&
+          steps.analyze_delta.outputs.security_flagged != 'true'
+        run: |
+          gh pr merge "${{ steps.create_pr.outputs.pr_number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --auto \
+            --merge
+          echo "Auto-merge enabled on PR #${{ steps.create_pr.outputs.pr_number }}."
+
+  repair:
+    name: Self-Repair (Copilot Agent)
+    runs-on: ubuntu-latest
+    needs: sync
+    if: always() && needs.sync.result != 'skipped'
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+
+    steps:
+      # SAFETY: Always run this assertion first. Add --repo "$GITHUB_REPOSITORY" to any new gh command you add here.
+      - name: Assert fork context
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "${{ env.EXPECTED_REPO }}" ]; then
+            echo "ERROR: This workflow is running on '$GITHUB_REPOSITORY' but is only intended to run on '${{ env.EXPECTED_REPO }}'."
+            echo "Refusing to proceed — this prevents accidental writes to the wrong repository."
+            exit 1
+          fi
+
+      - name: Check COPILOT_PAT
+        id: preflight
+        run: |
+          if [ -z "${{ secrets.COPILOT_PAT }}" ]; then
+            echo "::warning::COPILOT_PAT secret is not set. Skipping self-repair job."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - name: Setup Node
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure git identity
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          git remote add upstream https://github.com/gsd-build/get-shit-done.git 2>/dev/null || true
+          git fetch upstream
+
+      - name: Validate agent-task auth
+        if: steps.preflight.outputs.skip != 'true'
+        id: agent_auth
+        run: |
+          # The Copilot coding agent is triggered by creating a GitHub issue
+          # assigned to 'copilot'. This requires a classic OAuth PAT (ghp_...)
+          # with 'repo' scope — no codespace scope, no interactive login needed.
+          #
+          # IMPORTANT: gh agent-task create is NOT used. Despite having a valid
+          # ghp_... PAT with all required scopes stored in the credential store,
+          # gh agent-task still fails with "this command requires an OAuth token"
+          # because it internally requires a token obtained via the OAuth
+          # device/browser flow — which is impossible in CI. This is a gh CLI
+          # design constraint with no workaround.
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::COPILOT_PAT secret is not set. Cannot invoke Copilot coding agent."
+            echo "agent_auth_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "${GH_TOKEN:-}" | grep -q '^github_pat_'; then
+            echo "::error::COPILOT_PAT is a fine-grained token (github_pat_...). The Copilot issue-assignment trigger requires a classic OAuth PAT (ghp_...) with 'repo' scope. Regenerate at github.com/settings/tokens."
+            echo "agent_auth_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! echo "${GH_TOKEN:-}" | grep -q '^ghp_'; then
+            echo "::error::COPILOT_PAT does not appear to be a classic OAuth PAT (expected ghp_... prefix). Regenerate at github.com/settings/tokens."
+            echo "agent_auth_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ghp_... prefix is sufficient to confirm this is a classic OAuth PAT.
+          # Scope validation via 'gh auth status' is NOT used here: when GH_TOKEN
+          # is set as an env var (as it is in this job), gh reports 'Token scopes: none'
+          # because scope metadata is only stored when using 'gh auth login'.
+          # If the token lacks 'repo' scope, 'gh issue create' will fail with a
+          # clear API error at the point of use.
+          echo "COPILOT_PAT is a valid classic OAuth PAT. Ready for issue-based Copilot agent invocation."
+          echo "agent_auth_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve merge conflict via Copilot agent
+        if: steps.preflight.outputs.skip != 'true' && needs.sync.outputs.merge_conflict == 'true'
+        id: conflict_resolve
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          set -euo pipefail
+
+          # Emit safe defaults first so outputs are always defined even on early exit.
+          echo "conflict_resolved=false" >> "$GITHUB_OUTPUT"
+          echo "conflict_dead_end=false" >> "$GITHUB_OUTPUT"
+
+          CONFLICT_FILES="${{ needs.sync.outputs.merge_conflict_files }}"
+          UPSTREAM_SHA="${{ needs.sync.outputs.short_sha || 'unknown' }}"
+
+          echo "Attempting agent-assisted merge conflict resolution for: ${CONFLICT_FILES}"
+
+          # Re-establish the conflict state on the working branch
+          git checkout -B automated/upstream-sync origin/${{ env.DEFAULT_BRANCH }} 2>/dev/null || true
+          git merge "upstream/${{ env.UPSTREAM_BRANCH }}" --no-edit 2>/dev/null || true
+
+          # Capture the conflict diff (truncated to 15k)
+          CONFLICT_DIFF=$(git diff --diff-filter=U 2>/dev/null | head -c 15000 || echo "(conflict diff unavailable)")
+
+          cat > /tmp/conflict-resolve-prompt.md << PROMPT_EOF
+          You are the GSD upstream-sync merge conflict resolution agent.
+
+          A merge conflict occurred between the fork's main branch and upstream/main.
+          The following files have conflicts that could not be auto-resolved:
+
+          **Conflicting files:** ${CONFLICT_FILES}
+          **Upstream SHA:** ${UPSTREAM_SHA}
+
+          ## Your mission
+
+          Resolve the merge conflict to produce a clean, committable state.
+
+          ## Authority — what you MAY modify
+          - Any conflicting file listed above (to resolve the conflict)
+          - scripts/generate-prompts.mjs (if needed to handle upstream changes)
+          - scripts/verify-prompts.mjs (if needed)
+          - .github/prompts/**
+          - .github/agents/**
+          - .github/instructions/**
+          - README.md, FORK-CHANGELOG.md, AGENTS.md
+
+          ## Hard limit — NEVER modify
+          - commands/gsd/**
+          - agents/**
+          - get-shit-done/**
+
+          ## Fork identity rules for conflict resolution
+          - In fork-owned files (package.json, README.md, FORK-CHANGELOG.md, AGENTS.md):
+            the fork's content takes precedence. Accept upstream changes only where they
+            don't conflict with the fork's identity (e.g., accept upstream version bumps
+            to dependency fields, but keep fork-specific description/repository fields).
+          - CHANGELOG.md is upstream-owned: accept --theirs (the fork maintains FORK-CHANGELOG.md separately).
+          - In any other upstream-owned content that somehow drifted: accept --theirs.
+
+          ## Required steps
+          1. Resolve all conflicts in the listed files.
+          2. Run: git add -A && git commit -m "chore: resolve merge conflict with upstream/${UPSTREAM_SHA}"
+          3. Run: node scripts/generate-prompts.mjs
+          4. Run: node scripts/verify-prompts.mjs
+          5. Both must pass.
+          6. Open a PR from the copilot/* branch you created in this task targeting base: automated/upstream-sync (NOT main).
+          7. PR title: "sync: upstream changes (conflict resolved by agent)"
+          8. If the conflict cannot be resolved autonomously, write "DEAD_END" to /tmp/repair-dead-end.txt and stop.
+
+          ## Conflict diff
+          \`\`\`diff
+          ${CONFLICT_DIFF}
+          \`\`\`
+          PROMPT_EOF
+
+          # Trigger Copilot coding agent via issue assignment.
+          # gh agent-task create cannot be used in CI — it requires an interactive
+          # Trigger Copilot coding agent via issue assignment.
+          # Issue is created first (no assignee) to guarantee the issue exists
+          # and the prompt is captured even if Copilot assignment fails.
+          echo "Creating Copilot conflict-resolution issue..."
+          CONFLICT_ISSUE_URL=$(gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "fix(upstream-sync): resolve merge conflict [${{ needs.sync.outputs.short_sha || 'unknown' }}]" \
+            --body-file /tmp/conflict-resolve-prompt.md \
+            --label "upstream-sync" \
+            2>&1) || true
+          echo "gh issue create output: $CONFLICT_ISSUE_URL"
+          CONFLICT_ISSUE=$(echo "$CONFLICT_ISSUE_URL" | grep -oP '/issues/\K[0-9]+' || echo "")
+          [[ "$CONFLICT_ISSUE" =~ ^[0-9]+$ ]] || CONFLICT_ISSUE=""
+
+          if [ -n "$CONFLICT_ISSUE" ]; then
+            echo "Assigning Copilot coding agent to issue #${CONFLICT_ISSUE}..."
+            ASSIGN_OUT=$(gh issue edit "$CONFLICT_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --add-assignee "Copilot" \
+              2>&1) || true
+            echo "gh issue edit (assignee) output: $ASSIGN_OUT"
+            CONFLICT_ISSUE_CREATED_AT=$(gh issue view "$CONFLICT_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json createdAt \
+              --jq '.createdAt' 2>/dev/null || echo "")
+
+            if [ -z "$CONFLICT_ISSUE_CREATED_AT" ]; then
+              echo "::warning::Failed to retrieve creation time for issue #${CONFLICT_ISSUE}. Proceeding without PR association filter."
+            fi
+
+            echo "Created issue #${CONFLICT_ISSUE}. Waiting up to 20 minutes for Copilot to open a PR..."
+            POLL_MAX=24
+            POLL_COUNT=0
+            AGENT_PR=""
+            while [ $POLL_COUNT -lt $POLL_MAX ]; do
+              if [ -n "$CONFLICT_ISSUE_CREATED_AT" ]; then
+                export CONFLICT_ISSUE_CREATED_AT
+                AGENT_PR=$(gh pr list \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base "automated/upstream-sync" \
+                  --state open \
+                  --json number,headRefName,createdAt \
+                  --jq '.[] | select((.headRefName | startswith("copilot/")) and (.createdAt >= env.CONFLICT_ISSUE_CREATED_AT)) | .number' \
+                  2>/dev/null | head -1 || echo "")
+              else
+                AGENT_PR=$(gh pr list \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base "automated/upstream-sync" \
+                  --state open \
+                  --json number,headRefName \
+                  --jq '.[] | select(.headRefName | startswith("copilot/")) | .number' \
+                  2>/dev/null | head -1 || echo "")
+              fi
+              if [ -n "$AGENT_PR" ]; then
+                echo "Copilot PR #${AGENT_PR} found after ~$((POLL_COUNT * 50))s."
+                break
+              fi
+              sleep 50
+              POLL_COUNT=$((POLL_COUNT + 1))
+            done
+            if [ -n "$AGENT_PR" ]; then
+              gh issue close "$CONFLICT_ISSUE" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "Processed by upstream-sync conflict resolution step." \
+                2>/dev/null || true
+            else
+              echo "::warning::Copilot coding agent did not open a PR within 20 minutes. Leaving issue #${CONFLICT_ISSUE} open."
+            fi
+          else
+            echo "::warning::Failed to create conflict resolution issue."
+          fi
+
+          # Check if agent resolved conflicts (dead-end sentinel)
+          if [ -f /tmp/repair-dead-end.txt ]; then
+            echo "Agent declared DEAD_END on conflict resolution."
+            echo "conflict_dead_end=true" >> "$GITHUB_OUTPUT"
+          else
+            # Agent creates a copilot/* branch PR targeting automated/upstream-sync.
+            # Check for that PR's existence as the success signal — do NOT check local
+            # git state, which still reflects the unresolved merge from this runner.
+            AGENT_PR=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "automated/upstream-sync" \
+              --state open \
+              --json number,headRefName \
+              --jq '.[] | select(.headRefName | startswith("copilot/")) | .number' \
+              2>/dev/null | head -1 || echo "")
+            if [ -n "$AGENT_PR" ]; then
+              echo "Agent created PR #${AGENT_PR} — conflict resolution submitted."
+              echo "conflict_resolved=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Agent did not create a PR and no DEAD_END sentinel found — treating as unresolved."
+            fi
+          fi
+
+      - name: Repair loop
+        if: steps.preflight.outputs.skip != 'true' && needs.sync.outputs.merge_conflict != 'true'
+        id: repair_loop
+        run: |
+          set -euo pipefail
+
+          # Switch to the working branch that the sync job produced.
+          # The checkout step lands on main; the repair agent must operate on
+          # automated/upstream-sync so the verifier sees the sync-merged content
+          # and all merges/pushes go to the correct branch.
+          git fetch origin automated/upstream-sync ${{ env.DEFAULT_BRANCH }} 2>/dev/null || true
+          git checkout -B automated/upstream-sync origin/automated/upstream-sync 2>/dev/null || \
+            git checkout -B automated/upstream-sync origin/${{ env.DEFAULT_BRANCH }} 2>/dev/null || true
+
+          # If main is ahead of automated/upstream-sync (e.g. a prior repair PR was
+          # merged into main but automated/upstream-sync still points at an older commit),
+          # reset to main. Without this, the generator creates files that are already in
+          # main and git diff shows nothing new — so no commit is made and
+          # gh pr create fails with "no commits between main and automated/upstream-sync".
+          COMMITS_BEHIND=$(git rev-list HEAD..origin/${{ env.DEFAULT_BRANCH }} --count 2>/dev/null || echo "0")
+          if [ "$COMMITS_BEHIND" -gt 0 ]; then
+            echo "automated/upstream-sync is ${COMMITS_BEHIND} commit(s) behind ${{ env.DEFAULT_BRANCH }} — resetting to ${{ env.DEFAULT_BRANCH }} as new base."
+            git reset --hard origin/${{ env.DEFAULT_BRANCH }}
+          fi
+
+          # Run initial verify to see if repair is needed.
+          # Do this BEFORE the auth gate: if the verifier passes there is nothing
+          # for the agent to do and a bad/missing auth token is irrelevant.
+          if node scripts/verify-prompts.mjs 2>&1 | tee /tmp/verify_initial.log; then
+            echo "Verifier passed — no repair needed."
+            echo "repair_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REPAIR_NEEDED=true
+          CURRENT_ERRORS=$(cat /tmp/verify_initial.log | head -c 5000)
+
+          # Record the branch state NOW — before any self-heal commit or agent work.
+          # The guard step uses this as the diff baseline to see only what this job
+          # changed, rather than diffing the entire branch vs upstream/main (which
+          # would flag legitimately-merged upstream files as violations).
+          PRE_REPAIR_SHA=$(git rev-parse HEAD)
+          echo "$PRE_REPAIR_SHA" > /tmp/pre-repair-sha
+          echo "pre_repair_sha=${PRE_REPAIR_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Pre-repair SHA: ${PRE_REPAIR_SHA}"
+
+          # ── Self-heal pass ──────────────────────────────────────────────────────
+          # Most failures are simply stale generated prompts. Re-running the
+          # generator and committing is enough — no agent needed.
+          echo "Running generator self-heal pass..."
+          if node scripts/generate-prompts.mjs 2>&1 | tee /tmp/gen_selfheal.log; then
+            if node scripts/verify-prompts.mjs 2>&1 | tee /tmp/verify_selfheal.log; then
+              echo "Self-heal succeeded — generator fixed the verifier errors."
+              echo "--- git status before add ---"
+              git status --short .github/prompts/ scripts/ || true
+              # Use --all to ensure new (untracked) files are included, not just modifications.
+              # Split into one call per directory — if a directory doesn't exist git add
+              # fails the entire multi-path invocation, staging nothing.
+              git add --all .github/prompts/ 2>/dev/null || true
+              git add --all .github/agents/ 2>/dev/null || true
+              git add --all .github/instructions/ 2>/dev/null || true
+              git add --all scripts/ 2>/dev/null || true
+              echo "--- git diff --cached after add ---"
+              git diff --cached --stat || true
+              if ! git diff --cached --quiet; then
+                git commit -m "chore(upstream-sync): regenerate prompts after upstream merge"
+                git push origin HEAD:automated/upstream-sync --force-with-lease
+              else
+                echo "::warning::Generator ran and verifier passed, but no files were staged. The generated output may already match origin/main."
+              fi
+              # Ensure a PR exists to merge automated/upstream-sync → main.
+              # The sync job creates the PR when no verifier errors exist at sync time;
+              # when repair is needed the sync job does NOT create a PR, so we must.
+              EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+                --head "automated/upstream-sync" --json number --jq '.[0].number' 2>/dev/null || echo "")
+              if [ -z "$EXISTING_PR" ]; then
+                echo "No existing PR for automated/upstream-sync — creating one..."
+                PR_CREATE_EXIT=0
+                CREATED_PR_URL=$(gh pr create \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base main \
+                  --head "automated/upstream-sync" \
+                  --title "sync: upstream changes (self-heal)" \
+                  --body "Automated upstream sync. Verifier errors were resolved by the self-heal pass (generator re-run)." \
+                  --label "upstream-sync" \
+                  --label "automated" 2>&1) || PR_CREATE_EXIT=$?
+                echo "gh pr create output: $CREATED_PR_URL"
+                SYNC_PR_NUMBER=$(echo "$CREATED_PR_URL" | grep -oP '/pull/\K[0-9]+' || echo "")
+                if [ "$PR_CREATE_EXIT" -ne 0 ] && [ -z "$SYNC_PR_NUMBER" ]; then
+                  echo "::warning::gh pr create failed (exit $PR_CREATE_EXIT) and no open PR could be resolved for automated/upstream-sync. Auto-merge will be skipped."
+                fi
+              else
+                echo "PR #${EXISTING_PR} already exists for automated/upstream-sync."
+                SYNC_PR_NUMBER="$EXISTING_PR"
+              fi
+              # Enable auto-merge so the PR lands once all required checks pass.
+              # Prerequisite: Settings → General → Pull Requests → "Allow auto-merge" must be ON.
+              # If this warning fires, enable that setting in the repo and re-run.
+              if [ -n "$SYNC_PR_NUMBER" ]; then
+                gh pr merge "$SYNC_PR_NUMBER" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --auto \
+                  --merge 2>&1 || echo "::warning::Failed to enable auto-merge on PR #${SYNC_PR_NUMBER}. Enable 'Allow auto-merge' in Settings → General → Pull Requests, then re-run."
+              fi
+              echo "repair_needed=true" >> "$GITHUB_OUTPUT"
+              echo "repair_succeeded=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "Generator ran but verifier still fails — agent repair needed."
+              CURRENT_ERRORS=$(cat /tmp/verify_selfheal.log | head -c 5000)
+            fi
+          else
+            echo "Generator itself failed — agent repair needed."
+          fi
+          # ────────────────────────────────────────────────────────────────────────
+
+          # Verifier failed — we need the agent. Now check auth.
+          if [ "${{ steps.agent_auth.outputs.agent_auth_ok }}" = "false" ]; then
+            echo "::error::Repair needed but COPILOT_PAT auth failed. See 'Validate agent-task auth' step. Verifier errors:"
+            cat /tmp/verify_initial.log
+            echo "dead_end=true" >> "$GITHUB_OUTPUT"
+            echo "repair_needed=true" >> "$GITHUB_OUTPUT"
+            echo "repair_succeeded=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STRATEGIES=("basic_verifier_fix" "contextual_generative_fix" "full_rewrite" "alt_approach")
+          STRATEGY_IDX=0
+          REPAIR_NEEDED=false
+          REPAIR_SUCCEEDED=false
+          DEAD_END=false
+
+          # Gather diagnostic context once
+          # UPSTREAM_DIFF is the primary context source — re-derived here because /tmp/delta-analysis.md
+          # from the sync job is NOT available cross-job (different runner). The git diff provides equivalent context.
+          UPSTREAM_DIFF=$(git diff HEAD upstream/main -- . \
+            ':(exclude)commands/gsd' ':(exclude)get-shit-done' ':(exclude)agents' \
+            2>/dev/null | head -c 20000 || true)
+          GENERATOR_SRC=$(cat scripts/generate-prompts.mjs 2>/dev/null || echo "(unavailable)")
+          VERIFIER_SRC=$(cat scripts/verify-prompts.mjs 2>/dev/null || echo "(unavailable)")
+          # Expected to fall back to "(delta analysis unavailable)" in the repair job — UPSTREAM_DIFF above is the primary source.
+          DELTA_ANALYSIS=$(cat /tmp/delta-analysis.md 2>/dev/null || echo "(delta analysis unavailable — different runner; see UPSTREAM_DIFF above)")
+
+          build_repair_prompt() {
+            local strategy=$1
+            local attempt=$2
+            local current_errors=$3
+
+            # Collect prior patches for context
+            local prior_patches=""
+            for i in $(seq 1 $((attempt - 1))); do
+              if [ -f "/tmp/patch_attempt_${i}.diff" ]; then
+                prior_patches="${prior_patches}"$'\n\n'"## Failed Patch — Attempt ${i} (strategy: ${STRATEGIES[$((i-1))]})"
+                prior_patches="${prior_patches}"$'\n'"$(cat /tmp/patch_attempt_${i}.diff | head -c 4000)"
+              fi
+            done
+
+            # Strategy-specific framing
+            local framing=""
+            case "$strategy" in
+              basic_verifier_fix)
+                framing="Focus on the exact verifier error messages. Make the smallest targeted fix that makes verify-prompts.mjs pass."
+                ;;
+              contextual_generative_fix)
+                framing="Prior targeted fix(es) did not work. Now consider the full upstream delta context. What structural change in upstream caused this? Fix generate-prompts.mjs or verify-prompts.mjs to handle the new upstream pattern."
+                ;;
+              full_rewrite)
+                framing="Prior fixes failed. Rewrite the failing section(s) of generate-prompts.mjs and/or verify-prompts.mjs from scratch. Ignore prior patches — take a clean approach. You may rewrite the entire file if needed."
+                ;;
+              alt_approach)
+                framing="All prior strategies failed. Try a completely different architectural approach. Consider whether a different data structure, parsing strategy, or output format would resolve the issue. Be creative."
+                ;;
+            esac
+
+            cat <<PROMPT
+          You are the GSD upstream-sync repair agent. Attempt ${attempt}, strategy: ${strategy}.
+
+          ${framing}
+
+          ## Authority — what you MAY modify
+          - scripts/generate-prompts.mjs
+          - scripts/verify-prompts.mjs
+          - scripts/tools.json
+          - .github/workflows/upstream-sync.yml
+          - .github/prompts/**
+          - .github/agents/**
+          - .github/instructions/**
+          - README.md
+          - FORK-CHANGELOG.md
+          - AGENTS.md
+
+          ## Hard limit — NEVER modify
+          - commands/gsd/**
+          - agents/**
+          - get-shit-done/**
+
+          ## Required steps
+          1. Fix the issue.
+          2. Run: node scripts/generate-prompts.mjs && node scripts/verify-prompts.mjs
+          3. Both must pass.
+          4. Open a PR targeting branch: automated/upstream-sync
+          5. Write a descriptive commit message explaining what you changed and why.
+          6. If you determine the problem requires human input or cannot be solved autonomously, write "DEAD_END" to /tmp/repair-dead-end.txt and stop immediately.
+
+          ## Current Verifier Errors
+          \`\`\`
+          ${current_errors}
+          \`\`\`
+
+          ## Upstream Delta Analysis
+          ${DELTA_ANALYSIS}
+
+          ## Upstream Diff (truncated to 20k chars)
+          \`\`\`diff
+          ${UPSTREAM_DIFF}
+          \`\`\`
+
+          ## scripts/generate-prompts.mjs (current)
+          \`\`\`js
+          ${GENERATOR_SRC}
+          \`\`\`
+
+          ## scripts/verify-prompts.mjs (current)
+          \`\`\`js
+          ${VERIFIER_SRC}
+          \`\`\`
+          ${prior_patches}
+          PROMPT
+          }
+
+          # Strategy-pool loop
+          while [ "$STRATEGY_IDX" -lt "${#STRATEGIES[@]}" ]; do
+            STRATEGY="${STRATEGIES[$STRATEGY_IDX]}"
+            ATTEMPT=$((STRATEGY_IDX + 1))
+            STRATEGY_IDX=$((STRATEGY_IDX + 1))
+
+            echo "::group::Repair attempt ${ATTEMPT} — strategy: ${STRATEGY}"
+
+            # Write prompt to file (avoids shell escaping issues)
+            build_repair_prompt "$STRATEGY" "$ATTEMPT" "$CURRENT_ERRORS" > /tmp/repair_prompt_${ATTEMPT}.txt
+
+            # Snapshot branch state before agent runs (for no-diff dead-end detection)
+            PRE_AGENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+            # Trigger Copilot coding agent via issue assignment.
+            # IMPORTANT: gh agent-task create is intentionally NOT used.
+            # gh agent-task requires a token from the OAuth device/browser flow —
+            # it internally checks the token's origin, not just its scopes. A ghp_...
+            # PAT with every required scope (codespace, repo, workflow) stored in
+            # the gh credential store is still rejected with "this command requires
+            # an OAuth token". This is a gh CLI design constraint with no workaround.
+            # Issue is created first (no assignee) to guarantee the issue exists
+            # and the prompt is captured even if Copilot assignment fails.
+            COPILOT_PR=""
+            REPAIR_ISSUE_URL=$(gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "repair(upstream-sync): fix verifier [attempt ${ATTEMPT}, ${STRATEGY}]" \
+              --body-file /tmp/repair_prompt_${ATTEMPT}.txt \
+              --label "upstream-sync" \
+              2>&1) || true
+            echo "gh issue create output: $REPAIR_ISSUE_URL"
+            REPAIR_ISSUE=$(echo "$REPAIR_ISSUE_URL" | grep -oP '/issues/\K[0-9]+' || echo "")
+            [[ "$REPAIR_ISSUE" =~ ^[0-9]+$ ]] || REPAIR_ISSUE=""
+
+            if [ -z "$REPAIR_ISSUE" ]; then
+              echo "::warning::Failed to create Copilot repair issue (see output above)."
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "Assigning Copilot coding agent to issue #${REPAIR_ISSUE}..."
+            ASSIGN_OUT=$(gh issue edit "$REPAIR_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --add-assignee "Copilot" \
+              2>&1) || true
+            echo "gh issue edit (assignee) output: $ASSIGN_OUT"
+
+            REPAIR_ISSUE_CREATED_AT=$(gh issue view "$REPAIR_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json createdAt \
+              --jq '.createdAt' 2>/dev/null || echo "")
+
+            if [ -z "$REPAIR_ISSUE_CREATED_AT" ]; then
+              echo "::warning::Failed to retrieve creation time for issue #${REPAIR_ISSUE}. Proceeding without PR association filter."
+            fi
+
+            echo "Created issue #${REPAIR_ISSUE}. Waiting up to 20 minutes for Copilot coding agent to open a PR..."
+            POLL_MAX=24
+            POLL_COUNT=0
+            while [ $POLL_COUNT -lt $POLL_MAX ]; do
+              if [ -n "$REPAIR_ISSUE_CREATED_AT" ]; then
+                export REPAIR_ISSUE_CREATED_AT
+                COPILOT_PR=$(gh pr list \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base "automated/upstream-sync" \
+                  --state open \
+                  --json number,headRefName,createdAt \
+                  --jq '.[] | select((.headRefName | startswith("copilot/")) and (.createdAt >= env.REPAIR_ISSUE_CREATED_AT)) | .number' \
+                  2>/dev/null | head -1 || echo "")
+              else
+                COPILOT_PR=$(gh pr list \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base "automated/upstream-sync" \
+                  --state open \
+                  --json number,headRefName \
+                  --jq '.[] | select(.headRefName | startswith("copilot/")) | .number' \
+                  2>/dev/null | head -1 || echo "")
+              fi
+              if [ -n "$COPILOT_PR" ]; then
+                echo "Copilot PR #${COPILOT_PR} found after ~$((POLL_COUNT * 50))s."
+                break
+              fi
+              sleep 50
+              POLL_COUNT=$((POLL_COUNT + 1))
+            done
+
+            if [ -n "$COPILOT_PR" ]; then
+              gh issue close "$REPAIR_ISSUE" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "Processed by upstream-sync repair loop (attempt ${ATTEMPT}, strategy: ${STRATEGY})." \
+                2>/dev/null || true
+            else
+              echo "::warning::Copilot coding agent did not open a PR within 20 minutes on strategy ${STRATEGY}. Leaving issue #${REPAIR_ISSUE} open."
+            fi
+
+            if [ -n "$COPILOT_PR" ]; then
+              COPILOT_BRANCH=$(gh pr view "$COPILOT_PR" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json headRefName \
+                --jq '.headRefName' 2>/dev/null || echo "")
+              if [ -n "$COPILOT_BRANCH" ]; then
+                git fetch origin "$COPILOT_BRANCH" 2>/dev/null || true
+                git merge "origin/$COPILOT_BRANCH" --no-edit --allow-unrelated-histories 2>/dev/null || true
+                gh pr close "$COPILOT_PR" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --comment "Merged into automated/upstream-sync by repair loop (attempt ${ATTEMPT}, strategy: ${STRATEGY})." \
+                  || true
+              fi
+            else
+              # Pull any direct commits from agent
+              git pull origin automated/upstream-sync --rebase 2>/dev/null || true
+            fi
+
+            # Capture what the agent did
+            git diff "$PRE_AGENT_SHA" HEAD > /tmp/patch_attempt_${ATTEMPT}.diff 2>/dev/null || true
+
+            # Dead-end sentinel check
+            if [ -f /tmp/repair-dead-end.txt ]; then
+              DEAD_END=true
+              echo "::warning::Agent wrote DEAD_END sentinel on strategy ${STRATEGY}. Escalating."
+              echo "::endgroup::"
+              break
+            fi
+
+            # No-diff dead-end: agent ran but made no changes AND verifier still fails
+            if [ ! -s /tmp/patch_attempt_${ATTEMPT}.diff ]; then
+              echo "::warning::Agent made no changes on strategy ${STRATEGY}."
+              # Don't immediately dead-end — try next strategy
+            fi
+
+            # Re-run verifier
+            if node scripts/verify-prompts.mjs > /tmp/verify_attempt_${ATTEMPT}.log 2>&1; then
+              echo "Verifier passed on attempt ${ATTEMPT} (strategy: ${STRATEGY})."
+              REPAIR_SUCCEEDED=true
+
+              # Push the repaired branch
+              git push origin HEAD:automated/upstream-sync --force-with-lease
+
+              # Create or update the PR (if it doesn't already exist from the sync job's normal flow)
+              EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+                --head "automated/upstream-sync" --json number --jq '.[0].number' 2>/dev/null || echo "")
+              if [ -z "$EXISTING_PR" ]; then
+                PR_CREATE_EXIT=0
+                CREATED_PR_URL=$(gh pr create \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base main \
+                  --head "automated/upstream-sync" \
+                  --title "sync: upstream changes (autonomous repair)" \
+                  --body-file /tmp/pr-body.md \
+                  --label "upstream-sync" \
+                  --label "automated" 2>&1) || PR_CREATE_EXIT=$?
+                echo "gh pr create output: $CREATED_PR_URL"
+                SYNC_PR_NUMBER=$(echo "$CREATED_PR_URL" | grep -oP '/pull/\K[0-9]+' || echo "")
+                if [ "$PR_CREATE_EXIT" -ne 0 ] && [ -z "$SYNC_PR_NUMBER" ]; then
+                  echo "::warning::gh pr create failed (exit $PR_CREATE_EXIT) and no open PR could be resolved for automated/upstream-sync. Auto-merge will be skipped."
+                fi
+              else
+                SYNC_PR_NUMBER="$EXISTING_PR"
+              fi
+              if [ -n "$SYNC_PR_NUMBER" ]; then
+                gh pr merge "$SYNC_PR_NUMBER" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --auto \
+                  --merge 2>&1 || echo "::warning::Failed to enable auto-merge on PR #${SYNC_PR_NUMBER}. Enable 'Allow auto-merge' in Settings → General → Pull Requests, then re-run."
+              fi
+
+              echo "repair_succeeded=true" >> "$GITHUB_OUTPUT"
+              echo "repair_needed=true" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              break
+            fi
+
+            echo "::warning::Verifier failed after attempt ${ATTEMPT} (strategy: ${STRATEGY})."
+            CURRENT_ERRORS=$(cat /tmp/verify_attempt_${ATTEMPT}.log | head -c 5000)
+            echo "::endgroup::"
+          done
+
+          # Write final outputs
+          echo "repair_needed=true" >> "$GITHUB_OUTPUT"
+          if [ "$DEAD_END" = "true" ]; then
+            echo "dead_end=true" >> "$GITHUB_OUTPUT"
+            echo "repair_succeeded=false" >> "$GITHUB_OUTPUT"
+          elif [ "$REPAIR_SUCCEEDED" = "false" ]; then
+            echo "attempts_exhausted=true" >> "$GITHUB_OUTPUT"
+            echo "repair_succeeded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Write repair summary to step summary
+          echo "## Repair Loop Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Strategies tried: ${STRATEGY_IDX} of ${#STRATEGIES[@]}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Repair succeeded: ${REPAIR_SUCCEEDED}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dead end: ${DEAD_END}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Filesystem guard (post-repair)
+        if: steps.preflight.outputs.skip != 'true' && steps.repair_loop.outputs.repair_needed == 'true'
+        env:
+          PRE_REPAIR_BASELINE: ${{ steps.repair_loop.outputs.pre_repair_sha }}
+        run: |
+          bash scripts/guard-upstream-files.sh post-commit
+
+      - name: Escalate — Create GitHub issue
+        if: >
+          (needs.sync.result == 'failure' && needs.sync.outputs.merge_conflict != 'true') ||
+          steps.repair_loop.outputs.attempts_exhausted == 'true' ||
+          steps.repair_loop.outputs.dead_end == 'true' ||
+          steps.conflict_resolve.outputs.conflict_dead_end == 'true' ||
+          needs.sync.outputs.security_flagged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          set -euo pipefail
+
+          NOTIFY="${{ vars.NOTIFY_MAINTAINER }}"
+          USER_TAG=""
+          if [ "${NOTIFY:-true}" != "false" ]; then
+            USER_TAG="@dwisner — manual intervention required."
+          fi
+
+          # Determine trigger type for stable title
+          TRIGGER_TYPE="strategies-exhausted"
+          if [ "${{ steps.repair_loop.outputs.dead_end }}" = "true" ]; then
+            TRIGGER_TYPE="dead-end-sentinel"
+          elif [ "${{ steps.conflict_resolve.outputs.conflict_dead_end }}" = "true" ]; then
+            TRIGGER_TYPE="merge-conflict-unresolvable"
+          fi
+
+          ISSUE_TITLE="sync-escalation: autonomous maintenance dead-end"
+
+          # Deduplication: check for existing open escalation issue
+          EXISTING_ISSUE=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "escalation" \
+            --state open \
+            --search '"sync-escalation: autonomous maintenance dead-end" in:title' \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          # Diagnostic content (truncated to stay well under 65k limit)
+          VERIFY_LOG=$(cat /tmp/verify_attempt_4.log 2>/dev/null | head -c 3000 || \
+                       cat /tmp/verify_attempt_3.log 2>/dev/null | head -c 3000 || \
+                       cat /tmp/verify_initial.log 2>/dev/null | head -c 3000 || echo "(none)")
+          UPSTREAM_DIFF_EXCERPT=$(git diff HEAD upstream/main -- . \
+            ':(exclude)commands/gsd' ':(exclude)get-shit-done' ':(exclude)agents' \
+            2>/dev/null | head -c 8000 || echo "(none)")
+
+          # Build escalation body
+          cat > /tmp/escalation-body.md << ESC_EOF
+          ## Escalation: ${TRIGGER_TYPE}
+
+          The autonomous upstream-sync repair agent reached a dead-end on this run.
+
+          **Trigger:** ${TRIGGER_TYPE}
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ${USER_TAG}
+
+          ### Verifier Output (last attempt)
+          \`\`\`
+          ${VERIFY_LOG}
+          \`\`\`
+
+          ### Upstream Diff (excerpt)
+          \`\`\`diff
+          ${UPSTREAM_DIFF_EXCERPT}
+          \`\`\`
+          ESC_EOF
+
+          # --- Channel 1: GitHub Issue (create or comment on existing) ---
+          if [ -n "$EXISTING_ISSUE" ] && [ "$EXISTING_ISSUE" != "null" ]; then
+            echo "Open escalation issue #${EXISTING_ISSUE} already exists. Adding comment."
+            gh issue comment "$EXISTING_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file /tmp/escalation-body.md
+            ISSUE_REF="$EXISTING_ISSUE"
+          else
+            echo "Creating new escalation issue..."
+            # Ensure the label exists (idempotent — never fails if already present)
+            gh label create "escalation" \
+              --color "d93f0b" \
+              --description "Escalation required: autonomous maintenance dead-end" \
+              --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+            # Create issue without label flag (so creation never fails due to missing label)
+            NEW_ISSUE_URL=$(gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${ISSUE_TITLE}" \
+              --body-file /tmp/escalation-body.md)
+            ISSUE_REF=$(basename "$NEW_ISSUE_URL")
+
+            # Apply label separately — failure here is non-fatal
+            gh issue edit "$ISSUE_REF" \
+              --repo "$GITHUB_REPOSITORY" \
+              --add-label "escalation" 2>/dev/null || true
+
+            echo "Created escalation issue #${ISSUE_REF}."
+          fi
+
+          # --- Channel 2: Comment on open sync PR (if one exists) ---
+          OPEN_PR=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "automated/upstream-sync" \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -n "$OPEN_PR" ] && [ "$OPEN_PR" != "null" ]; then
+            echo "Posting escalation comment on sync PR #${OPEN_PR}..."
+            PR_COMMENT="🚨 **Escalation triggered:** \`${TRIGGER_TYPE}\`. See issue #${ISSUE_REF} for details. ${USER_TAG}"
+            gh pr comment "$OPEN_PR" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "$PR_COMMENT"
+            echo "Comment posted on sync PR #${OPEN_PR}."
+          else
+            echo "No open sync PR found. Skipping PR comment (issue created above)."
+          fi
+
+  guard:
+    # SAFETY: Always run the 'Assert fork context' step first. Add --repo "$GITHUB_REPOSITORY" to any new gh command you add here.
+    name: Filesystem Guard (copilot/* branches)
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/copilot/')
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      # SAFETY: Always run this assertion first. Add --repo "$GITHUB_REPOSITORY" to any new gh command you add here.
+      - name: Assert fork context
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "${{ env.EXPECTED_REPO }}" ]; then
+            echo "ERROR: This workflow is running on '$GITHUB_REPOSITORY' but is only intended to run on '${{ env.EXPECTED_REPO }}'."
+            echo "Refusing to proceed — this prevents accidental writes to the wrong repository."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/gsd-build/get-shit-done.git 2>/dev/null || true
+          git fetch upstream
+
+      - name: Run filesystem guard
+        run: |
+          bash scripts/guard-upstream-files.sh post-commit
+
+  release-mirror:
+    name: Release Mirror
+    runs-on: ubuntu-latest
+    # Must wait for repair: if repair is regenerating prompts and creating a PR,
+    # we don't want the release mirror to run against an inconsistent branch state.
+    needs: [sync, repair]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+
+    steps:
+      # SAFETY: Always run this assertion first. Add --repo "$GITHUB_REPOSITORY" to any new gh command you add here.
+      - name: Assert fork context
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "${{ env.EXPECTED_REPO }}" ]; then
+            echo "ERROR: This workflow is running on '$GITHUB_REPOSITORY' but is only intended to run on '${{ env.EXPECTED_REPO }}'."
+            echo "Refusing to proceed — this prevents accidental writes to the wrong repository."
+            exit 1
+          fi
+
+      - name: Check COPILOT_PAT
+        id: preflight
+        run: |
+          if [ -z "${{ secrets.COPILOT_PAT }}" ]; then
+            echo "::warning::COPILOT_PAT secret is not set. Skipping release-mirror job."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect upstream release
+        if: steps.preflight.outputs.skip != 'true'
+        id: detect_release
+        run: |
+          UPSTREAM_REPO="${{ env.UPSTREAM_REPO }}"
+
+          UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" \
+            --jq '.tag_name' 2>/dev/null || echo "")
+
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "No upstream release found. Exiting silently."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "upstream_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest release: ${UPSTREAM_TAG}"
+
+      - name: Check if already mirrored
+        if: steps.preflight.outputs.skip != 'true' && steps.detect_release.outputs.skip != 'true'
+        id: check_mirror
+        run: |
+          UPSTREAM_TAG="${{ steps.detect_release.outputs.upstream_tag }}"
+
+          MIRRORED=$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName \
+            --jq "[.[] | select(.tagName | contains(\"upstream-${UPSTREAM_TAG}\"))] | length" \
+            2>/dev/null || echo "0")
+
+          if [ "$MIRRORED" -gt 0 ]; then
+            echo "Already mirrored upstream release ${UPSTREAM_TAG}. Exiting silently."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "New upstream release detected: ${UPSTREAM_TAG}"
+
+      # REL-06: Validate that the fork is no more than 1 release behind upstream.
+      # Runs regardless of whether the current upstream tag is already mirrored.
+      # A gap of 0 (fully current) or 1 (mirror job will handle it this run) is normal and silent.
+      # A gap > 1 means the mirror job has been failing silently — alert the maintainer.
+      - name: Lockstep validation
+        if: steps.preflight.outputs.skip != 'true' && steps.detect_release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_REPO="${{ env.UPSTREAM_REPO }}"
+          REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
+
+          # Get the last 10 upstream release tag names (newest first)
+          UPSTREAM_TAGS=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=10" \
+            --jq '[.[].tag_name]' 2>/dev/null || echo "[]")
+
+          # Get fork's latest release tag
+          FORK_LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '.tag_name // empty' 2>/dev/null || echo "")
+
+          if [ -z "$FORK_LATEST" ] || [ "$FORK_LATEST" = "null" ]; then
+            # No fork releases yet — gap = total upstream count in our window
+            GAP=$(echo "$UPSTREAM_TAGS" | jq 'length')
+          else
+            # Extract the embedded upstream tag: "v0.0.3-upstream-v2.1.0" → "v2.1.0"
+            EMBEDDED=$(echo "$FORK_LATEST" | sed 's/.*-upstream-//' || echo "")
+
+            if [ -z "$EMBEDDED" ]; then
+              # Fork latest release is not a mirror release — treat as unknown gap
+              GAP=99
+            else
+              # Find position (0-indexed) of embedded tag in upstream releases list
+              # Position 0 = fully current, 1 = one behind (this run will fix it), >1 = alert
+              POSITION=$(echo "$UPSTREAM_TAGS" | jq --arg tag "$EMBEDDED" 'index($tag) // 99')
+              GAP=$POSITION
+            fi
+          fi
+
+          echo "Release lockstep gap: ${GAP} (fork is ${GAP} upstream release(s) behind)"
+
+          if [ "$GAP" -le 1 ]; then
+            echo "Gap is acceptable (≤1). No alert needed."
+            exit 0
+          fi
+
+          # Gap > 1: create or update a deduplicating alert issue
+          ISSUE_TITLE="[upstream-mirror] Release lockstep gap"
+          UPSTREAM_LATEST="${{ steps.detect_release.outputs.upstream_tag }}"
+
+          EXISTING=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --search "is:issue is:open \"${ISSUE_TITLE}\" in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          cat > /tmp/lockstep-body.md << BODY_EOF
+          ## Release lockstep gap detected
+
+          The fork is **${GAP}** upstream release(s) behind. The release-mirror job should keep this gap at ≤1 on each run. A persistent gap suggests the mirror job has been failing silently.
+
+          | Field | Value |
+          |---|---|
+          | Upstream latest release | \`${UPSTREAM_LATEST}\` |
+          | Fork latest release | \`${FORK_LATEST:-"(none)"}\` |
+          | Gap | ${GAP} release(s) |
+          | Workflow run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ### Resolution
+          1. Check the release-mirror job logs for the failing run.
+          2. If the release-mirror job completed successfully this run, the gap will reduce to 0 automatically.
+          3. Close this issue once the fork's latest release mirrors the upstream latest.
+          BODY_EOF
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file /tmp/lockstep-body.md
+            echo "::warning::Lockstep gap=${GAP}. Updated existing issue #${EXISTING}."
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${ISSUE_TITLE}" \
+              --label "upstream-mirror" \
+              --label "bug" \
+              ${REPO_OWNER:+--assignee "$REPO_OWNER"} \
+              --body-file /tmp/lockstep-body.md
+            echo "::warning::Lockstep gap=${GAP}. Created new alert issue."
+          fi
+
+      # Gate step: consolidates all skip signals into a single `proceed` output.
+      # A skipped step emits empty-string outputs; 'someStep.outputs.x != true' is TRUE for empty string,
+      # which would cause all downstream write-steps to fire incorrectly if gated only on check_mirror.
+      # Using == 'true' here means the gate itself being skipped (empty proceed) naturally blocks downstream.
+      - name: Gate — proceed only if release is new
+        if: steps.preflight.outputs.skip != 'true' && steps.detect_release.outputs.skip != 'true' && steps.check_mirror.outputs.skip != 'true'
+        id: gate
+        run: |
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "All guards passed — proceeding with tag push and release mirroring."
+
+      - name: Compute fork tag
+        if: steps.gate.outputs.proceed == 'true'
+        id: compute_tag
+        run: |
+          UPSTREAM_TAG="${{ steps.detect_release.outputs.upstream_tag }}"
+
+          FORK_LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '.tag_name' 2>/dev/null || echo "")
+
+          if [ -z "$FORK_LATEST" ] || [ "$FORK_LATEST" = "null" ]; then
+            FORK_PATCH=0
+          else
+            BASE_VER="${FORK_LATEST%%-*}"     # "v0.0.3-upstream-v2.1.0" → "v0.0.3"
+            FORK_PATCH="${BASE_VER##*.}"       # "v0.0.3" → "3"
+          fi
+
+          NEXT_PATCH=$((FORK_PATCH + 1))
+          NEW_TAG="v0.0.${NEXT_PATCH}-upstream-${UPSTREAM_TAG}"
+
+          echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Computed new fork tag: ${NEW_TAG}"
+
+      - name: Checkout fork for tag push
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - name: Configure git identity
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Push fork tag via COPILOT_PAT
+        # COPILOT_PAT REQUIRED: GITHUB_TOKEN tag pushes do NOT trigger downstream workflows.
+        # release.yml fires on push:tags:v* — this ONLY works if the tag is pushed via a PAT.
+        if: steps.gate.outputs.proceed == 'true'
+        id: push_tag
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.COPILOT_PAT }}@github.com/${{ github.repository }}.git"
+          NEW_TAG="${{ steps.compute_tag.outputs.new_tag }}"
+          UPSTREAM_TAG="${{ steps.detect_release.outputs.upstream_tag }}"
+
+          git tag -a "$NEW_TAG" -m "Mirror upstream release ${UPSTREAM_TAG}"
+          git push origin "$NEW_TAG"
+
+          echo "Pushed tag: ${NEW_TAG}"
+
+      - name: Poll for release.yml to create release
+        if: steps.gate.outputs.proceed == 'true'
+        id: poll_release
+        run: |
+          NEW_TAG="${{ steps.compute_tag.outputs.new_tag }}"
+          CREATED=false
+
+          echo "Polling for release creation by release.yml (max 5 min: 20 × 15s)..."
+          for i in $(seq 1 20); do
+            RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/${NEW_TAG}" \
+              --jq '.id // empty' 2>/dev/null || echo "")
+            # Guard: gh api writes error JSON to stdout on non-200 responses;
+            # reject anything that is not a bare integer (e.g. JSON 404 payloads).
+            [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || RELEASE_ID=""
+            if [ -n "$RELEASE_ID" ]; then
+              echo "Release created (id=${RELEASE_ID}) after attempt ${i}."
+              CREATED=true
+              echo "created=true" >> "$GITHUB_OUTPUT"
+              echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "  Waiting... attempt ${i}/20"
+            sleep 15
+          done
+
+          if [ "$CREATED" = "false" ]; then
+            echo "::warning::release.yml did not create release within 5 minutes. Will create directly."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release body
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          NEW_TAG="${{ steps.compute_tag.outputs.new_tag }}"
+          UPSTREAM_TAG="${{ steps.detect_release.outputs.upstream_tag }}"
+          UPSTREAM_REPO="${{ env.UPSTREAM_REPO }}"
+
+          UPSTREAM_BODY=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" \
+            --jq '.body' 2>/dev/null || echo "")
+
+          # Guard: jq returns literal string "null" for JSON null fields (P2)
+          if [ -z "$UPSTREAM_BODY" ] || [ "$UPSTREAM_BODY" = "null" ]; then
+            UPSTREAM_BODY="_Upstream release notes unavailable._"
+          fi
+
+          # Quoted heredoc for static fork header — prevents expansion of any $ in fork-controlled text (P3)
+          cat > /tmp/release-body.md << 'HEADER_EOF'
+          ## Fork Mirror: __NEW_TAG__
+
+          | Field | Value |
+          |---|---|
+          | Fork tag | `__NEW_TAG__` |
+          | Upstream release | `__UPSTREAM_TAG__` |
+          | Upstream release URL | __UPSTREAM_URL__ |
+          | Sync status | ✅ Merged via upstream-sync |
+
+          ---
+
+          ## Upstream Release Notes (__UPSTREAM_TAG__)
+
+          HEADER_EOF
+
+          sed -i \
+            -e "s|__NEW_TAG__|${NEW_TAG}|g" \
+            -e "s|__UPSTREAM_TAG__|${UPSTREAM_TAG}|g" \
+            -e "s|__UPSTREAM_URL__|https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_TAG}|g" \
+            /tmp/release-body.md
+
+          # Append upstream body OUTSIDE heredoc to safely pass through $, backticks, etc. (P3)
+          printf '%s\n' "$UPSTREAM_BODY" >> /tmp/release-body.md
+
+      - name: Inject release body or create release directly
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          NEW_TAG="${{ steps.compute_tag.outputs.new_tag }}"
+
+          if [ "${{ steps.poll_release.outputs.created }}" = "true" ]; then
+            # release.yml already created the release — overwrite auto-generated notes
+            # Use release ID (not tag name) to avoid 'release not found' from gh release edit's by-tag lookup
+            RELEASE_ID="${{ steps.poll_release.outputs.release_id }}"
+            # Sanity-check: must be a numeric ID — fail loudly rather than corrupt the API call
+            if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::RELEASE_ID '$RELEASE_ID' is not a valid numeric ID. Aborting release body patch."
+              exit 1
+            fi
+            jq -n --rawfile body /tmp/release-body.md '{"body": $body}' > /tmp/release-patch.json
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/${RELEASE_ID}" \
+              --input /tmp/release-patch.json
+            echo "Release body updated via gh api PATCH (id=${RELEASE_ID})."
+          else
+            # Fallback: release.yml timed out; create release directly with full body
+            gh release create "$NEW_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "GSD Copilot ${NEW_TAG}" \
+              --notes-file /tmp/release-body.md
+            echo "Release created directly (fallback path)."
+          fi
+
+      - name: Handle failure — create or update GitHub issue
+        if: failure() && steps.preflight.outputs.skip != 'true'
+        run: |
+          UPSTREAM_TAG="${{ steps.detect_release.outputs.upstream_tag }}"
+          NEW_TAG="${{ steps.compute_tag.outputs.new_tag }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REPO_OWNER=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.owner.login' 2>/dev/null || echo "")
+          RECENT_LOG=$(git log --oneline -5 2>/dev/null || echo "(unavailable)")
+
+          # Stable title — run number must NOT appear here or dedup search will never match a prior issue
+          ISSUE_TITLE="[upstream-mirror] Release mirror failure"
+
+          # Verbose diagnostic body written to file — never --body with inline multi-line string
+          cat > /tmp/failure-detail.md << BODY_EOF
+          ## upstream-mirror Failure — Run #${{ github.run_number }}
+
+          | Field | Value |
+          |---|---|
+          | Workflow run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Timestamp | ${TIMESTAMP} |
+          | Upstream tag checked | ${UPSTREAM_TAG:-"(not yet resolved)"} |
+          | Fork tag at failure | ${NEW_TAG:-"(not yet computed)"} |
+
+          ### Recent git log (last 5 commits)
+          \`\`\`
+          ${RECENT_LOG}
+          \`\`\`
+
+          ### Environment (secrets redacted)
+          - GITHUB_REPOSITORY: \`$GITHUB_REPOSITORY\`
+          - GITHUB_REF: \`$GITHUB_REF\`
+          - EXPECTED_REPO: \`${{ env.EXPECTED_REPO }}\`
+          BODY_EOF
+
+          # Deduplication: comment on existing open issue rather than create a duplicate
+          EXISTING=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --search "is:issue is:open \"${ISSUE_TITLE}\" in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file /tmp/failure-detail.md
+            echo "Commented on existing issue #${EXISTING}."
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${ISSUE_TITLE}" \
+              --label "bug" \
+              --label "upstream-mirror" \
+              ${REPO_OWNER:+--assignee "$REPO_OWNER"} \
+              --body-file /tmp/failure-detail.md
+            echo "Created new issue."
+          fi
+
