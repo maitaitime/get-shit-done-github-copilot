@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_REPO: darrylwisner/get-shit-done-github-copilot
+  EXPECTED_REPO: maitaitime/get-shit-done-github-copilot
 
 jobs:
   publish-release:
