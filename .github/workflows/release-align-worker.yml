@@ -1,7 +1,6 @@
 name: Release Align Worker
 on:
   schedule:
-    # check for new upstream releases hourly
     - cron: "13 * * * *"
   workflow_dispatch:
     inputs:
@@ -53,13 +52,11 @@ jobs:
           else
             UP_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || true)
           fi
-
           if [ -z "$UP_TAG" ]; then
             echo "No upstream release tag found; exiting."
             echo "upstream_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           echo "upstream_tag=$UP_TAG" >> "$GITHUB_OUTPUT"
           echo "Upstream release tag: $UP_TAG"
 
@@ -95,13 +92,12 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
           git remote set-url --push upstream DISABLED || true
 
-          # fork base
           git fetch origin "${BASE_BRANCH}" --prune --no-tags
 
-          # Fetch only the needed upstream tag into a namespaced tag; prevent tag auto-follow spam
+          # Only fetch the needed tag into a namespaced local tag to avoid collisions
           git fetch upstream --no-tags "refs/tags/${UP_TAG}:refs/tags/upstream/${UP_TAG}" --prune
 
-      - name: Create release-align branch at upstream tag (NO PUSH YET)
+      - name: Create release-align branch from fork base (workflows already correct)
         if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
         run: |
           set -euo pipefail
@@ -109,145 +105,47 @@ jobs:
           SAFE_TAG=$(echo "$UP_TAG" | sed 's/[^A-Za-z0-9._-]/-/g')
           BR="automated/release-align-${SAFE_TAG}"
 
-          git rev-parse "refs/tags/upstream/${UP_TAG}" >/dev/null
-          git checkout -B "$BR" "refs/tags/upstream/${UP_TAG}"
+          git checkout -B "$BR" "origin/${BASE_BRANCH}"
           echo "BRANCH=$BR" >> "$GITHUB_ENV"
 
-      # ---- Critical: enforce fork-owned workflows BEFORE any push ----
-      - name: Force fork-owned workflows (pre-push safety)
+      - name: Overlay upstream tag snapshot onto branch (excluding fork-owned paths)
         if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
         run: |
           set -euo pipefail
-          BASE="${BASE_BRANCH}"
+          UP_TAG="${{ steps.tag.outputs.upstream_tag }}"
 
-          # If fork base has workflows, restore them exactly; otherwise delete workflows entirely.
-          if git cat-file -e "origin/${BASE}:.github/workflows" 2>/dev/null; then
-            echo "Restoring .github/workflows from origin/${BASE}"
-            git checkout "origin/${BASE}" -- .github/workflows
-            git add -A .github/workflows
-          else
-            echo "Fork base has no .github/workflows; removing any workflows from upstream snapshot"
-            rm -rf .github/workflows || true
-            git add -A .github/workflows || true
-          fi
+          # Bring upstream tag content in, but DO NOT touch fork-owned areas.
+          # This keeps .github/workflows unchanged (avoids GitHub push rejection).
+          git checkout "refs/tags/upstream/${UP_TAG}" -- \
+            . \
+            ':(exclude).github/workflows' \
+            ':(exclude).github/prompts' \
+            ':(exclude).github/instructions' \
+            ':(exclude).github/agents' \
+            ':(exclude)scripts'
+
+          git add -A
 
           if git diff --cached --quiet; then
-            echo "No workflow changes staged."
+            echo "No upstream snapshot changes staged (unexpected)."
           else
-            git commit -m "chore: enforce fork-owned workflows (release align)" || true
+            git commit -m "chore: align to upstream tag snapshot ${UP_TAG}" || true
           fi
 
-      - name: Materialize exemption script (from fork base if present; else fallback)
+      - name: Apply guard exemptions (globs+recursive; lenient)
         if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
         run: |
           set -euo pipefail
-          BASE="${BASE_BRANCH}"
-
-          if git cat-file -e "origin/${BASE}:scripts/apply-guard-exemptions.sh" 2>/dev/null; then
-            echo "Using scripts/apply-guard-exemptions.sh from origin/${BASE}"
-            git show "origin/${BASE}:scripts/apply-guard-exemptions.sh" > /tmp/apply-guard-exemptions.sh
-          else
-            echo "::warning::apply-guard-exemptions.sh not found on origin/${BASE}. Using embedded fallback."
-            cat > /tmp/apply-guard-exemptions.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          BASE_BRANCH="${BASE_BRANCH:-main}"
-          EXEMPTIONS_FILE="${EXEMPTIONS_FILE:-scripts/guard-exemptions.txt}"
-
-          if [[ ! -f "$EXEMPTIONS_FILE" ]]; then
-            echo "No exemptions file at $EXEMPTIONS_FILE; nothing to apply."
-            exit 0
-          fi
-
-          git fetch origin "${BASE_BRANCH}" --prune --no-tags >/dev/null 2>&1 || true
-          mapfile -t RAW_LINES < <(grep -vE '^\s*($|#)' "$EXEMPTIONS_FILE" || true)
-
-          is_glob_pattern() {
-            local pat="$1"
-            [[ "$pat" == *"/**"* || "$pat" == *"*"* || "$pat" == *"?"* || "$pat" == *"["*"]"* ]]
-          }
-
-          expand_pattern() {
-            local pat="$1"
-
-            if [[ "$pat" == *"/**"* ]]; then
-              local prefix="${pat%%/***}"
-              prefix="${prefix%/}"
-              git ls-files -- "$prefix" || true
-              return 0
-            fi
-
-            if [[ "$pat" == *"*"* || "$pat" == *"?"* || "$pat" == *"["*"]"* ]]; then
-              git ls-files -- "$pat" || true
-              return 0
-            fi
-
-            echo "$pat"
-          }
-
-          applied=false
-
-          for raw in "${RAW_LINES[@]}"; do
-            pat="$(echo "$raw" | sed 's/#.*//' | xargs)"
-            [[ -z "$pat" ]] && continue
-
-            glob_mode=false
-            if is_glob_pattern "$pat"; then
-              glob_mode=true
-            fi
-
-            while IFS= read -r f; do
-              [[ -z "$f" ]] && continue
-
-              if git cat-file -e "origin/${BASE_BRANCH}:$f" 2>/dev/null; then
-                echo "Exempt (base wins): $f"
-                git checkout "origin/${BASE_BRANCH}" -- "$f"
-                git add "$f" >/dev/null 2>&1 || true
-                applied=true
-              else
-                if [[ "$glob_mode" == "true" ]]; then
-                  echo "Exempt glob (base missing -> remove): $f"
-                  git rm -f --ignore-unmatch "$f" >/dev/null 2>&1 || true
-                  rm -f "$f" >/dev/null 2>&1 || true
-                  git add -A -- "$f" >/dev/null 2>&1 || true
-                  applied=true
-                else
-                  echo "::warning::Exempt literal '$f' not found in origin/${BASE_BRANCH}; skipping (no delete)."
-                fi
-              fi
-            done < <(expand_pattern "$pat")
-          done
-
-          if [[ "$applied" == "true" ]]; then
-            echo "Guard exemptions applied."
-          else
-            echo "No exemptions matched any tracked files."
-          fi
-          EOF
-          fi
-
-          chmod +x /tmp/apply-guard-exemptions.sh
-
-      - name: Apply guard exemptions (fork-owned; globs+recursive; lenient)
-        if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
-        run: |
-          set -euo pipefail
+          # scripts/guard-exemptions.txt exists because we are based on fork main
           export BASE_BRANCH="${BASE_BRANCH}"
           export EXEMPTIONS_FILE="${EXEMPTIONS_FILE}"
-          bash /tmp/apply-guard-exemptions.sh
+          bash scripts/apply-guard-exemptions.sh
 
           if git diff --cached --quiet; then
-            echo "No exemptions staged."
+            echo "No exemption changes staged."
           else
             git commit -m "chore: enforce fork-owned files (release align)" || true
           fi
-
-      - name: Push safe baseline branch (after workflows + exemptions)
-        if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
-        run: |
-          set -euo pipefail
-          git push -u origin "${BRANCH}" --force-with-lease
 
       - name: Setup Node
         if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
@@ -314,7 +212,7 @@ jobs:
             git commit -m "chore: release-align prompts for ${{ steps.tag.outputs.upstream_tag }}" || true
           fi
 
-      - name: Push release-align branch (with prompts)
+      - name: Push release-align branch (with snapshot + prompts)
         if: steps.tag.outputs.upstream_tag != '' && steps.mirrored.outputs.needs_mirror == 'true'
         run: |
           set -euo pipefail
@@ -332,4 +230,4 @@ jobs:
             -f upstream_tag="${{ steps.tag.outputs.upstream_tag }}" \
             -f target_ref="${BRANCH}" \
             -f force="false"
-          echo "Dispatched release-mirror-worker. It will push the fork tag; release.yml will build/upload the zip on tag push."
+          echo "Dispatched release-mirror-worker."
