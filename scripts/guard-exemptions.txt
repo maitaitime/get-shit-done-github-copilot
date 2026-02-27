@@ -1,4 +1,3 @@
-
 # guard-exemptions.txt — Files this fork intentionally diverges from upstream.
 #
 # The repair agent guard (guard-upstream-files.sh) treats all files present in
@@ -15,3 +14,8 @@
 # Files intentionally owned by this fork:
 README.md
 .github/CODEOWNERS
+AGENTS.md
+
+# Fork-owned workflows (recursive)
+.github/workflows/**
+
