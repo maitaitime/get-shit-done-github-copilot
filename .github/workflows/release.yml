@@ -3,6 +3,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to package (e.g. v0.0.6-upstream-v1.21.1). Blank = current ref."
+        required: false
+        default: ""
 
 concurrency:
   group: release-${{ github.ref }}
