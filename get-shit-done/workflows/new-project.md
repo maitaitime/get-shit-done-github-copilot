@@ -47,6 +47,7 @@ The document should describe what you want to build.
 
 ```bash
 INIT=$(node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" init new-project)
+if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 ```
 
 Parse JSON for: `researcher_model`, `synthesizer_model`, `roadmapper_model`, `commit_docs`, `project_exists`, `has_codebase_map`, `planning_exists`, `has_existing_code`, `has_package_file`, `is_brownfield`, `needs_codebase_map`, `has_git`, `project_path`.
@@ -177,6 +178,7 @@ Create `.planning/config.json` with mode set to "yolo":
     "research": true|false,
     "plan_check": true|false,
     "verifier": true|false,
+    "nyquist_validation": depth !== "quick",
     "auto_advance": true
   }
 }
@@ -475,7 +477,8 @@ Create `.planning/config.json` with all settings:
   "workflow": {
     "research": true|false,
     "plan_check": true|false,
-    "verifier": true|false
+    "verifier": true|false,
+    "nyquist_validation": depth !== "quick"
   }
 }
 ```
