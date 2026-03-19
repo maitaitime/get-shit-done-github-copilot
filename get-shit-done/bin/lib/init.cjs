@@ -31,7 +31,6 @@ function cmdInitExecutePhase(cwd, phase, raw) {
     // Config flags
     commit_docs: config.commit_docs,
     parallelization: config.parallelization,
-    context_window: config.context_window,
     branching_strategy: config.branching_strategy,
     phase_branch_template: config.phase_branch_template,
     milestone_branch_template: config.milestone_branch_template,
@@ -154,7 +153,7 @@ function cmdInitPlanPhase(cwd, phase, raw) {
       if (uatFile) {
         result.uat_path = toPosixPath(path.join(phaseInfo.directory, uatFile));
       }
-    } catch { /* intentionally empty */ }
+    } catch {}
   }
 
   output(result, raw);
@@ -168,26 +167,17 @@ function cmdInitNewProject(cwd, raw) {
   const braveKeyFile = path.join(homedir, '.gsd', 'brave_api_key');
   const hasBraveSearch = !!(process.env.BRAVE_API_KEY || fs.existsSync(braveKeyFile));
 
-  // Detect existing code (cross-platform — no Unix `find` dependency)
+  // Detect existing code
   let hasCode = false;
   let hasPackageFile = false;
   try {
-    const codeExtensions = new Set(['.ts', '.js', '.py', '.go', '.rs', '.swift', '.java']);
-    const skipDirs = new Set(['node_modules', '.git', '.planning', '.claude', '__pycache__', 'target', 'dist', 'build']);
-    function findCodeFiles(dir, depth) {
-      if (depth > 3) return false;
-      let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
-      for (const entry of entries) {
-        if (entry.isFile() && codeExtensions.has(path.extname(entry.name))) return true;
-        if (entry.isDirectory() && !skipDirs.has(entry.name)) {
-          if (findCodeFiles(path.join(dir, entry.name), depth + 1)) return true;
-        }
-      }
-      return false;
-    }
-    hasCode = findCodeFiles(cwd, 0);
-  } catch { /* intentionally empty — best-effort detection */ }
+    const files = execSync('find . -maxdepth 3 \\( -name "*.ts" -o -name "*.js" -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.swift" -o -name "*.java" \\) 2>/dev/null | grep -v node_modules | grep -v .git | head -5', {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    hasCode = files.trim().length > 0;
+  } catch {}
 
   hasPackageFile = pathExistsInternal(cwd, 'package.json') ||
                    pathExistsInternal(cwd, 'requirements.txt') ||
@@ -317,7 +307,7 @@ function cmdInitResume(cwd, raw) {
   let interruptedAgentId = null;
   try {
     interruptedAgentId = fs.readFileSync(path.join(cwd, '.planning', 'current-agent-id.txt'), 'utf-8').trim();
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const result = {
     // File existence
@@ -469,7 +459,7 @@ function cmdInitPhaseOp(cwd, phase, raw) {
       if (uatFile) {
         result.uat_path = toPosixPath(path.join(phaseInfo.directory, uatFile));
       }
-    } catch { /* intentionally empty */ }
+    } catch {}
   }
 
   output(result, raw);
@@ -504,9 +494,9 @@ function cmdInitTodos(cwd, area, raw) {
           area: todoArea,
           path: '.planning/todos/pending/' + file,
         });
-      } catch { /* intentionally empty */ }
+      } catch {}
     }
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const result = {
     // Config
@@ -553,9 +543,9 @@ function cmdInitMilestoneOp(cwd, raw) {
         const phaseFiles = fs.readdirSync(path.join(phasesDir, dir));
         const hasSummary = phaseFiles.some(f => f.endsWith('-SUMMARY.md') || f === 'SUMMARY.md');
         if (hasSummary) completedPhases++;
-      } catch { /* intentionally empty */ }
+      } catch {}
     }
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   // Check archive
   const archiveDir = path.join(cwd, '.planning', 'archive');
@@ -564,7 +554,7 @@ function cmdInitMilestoneOp(cwd, raw) {
     archivedMilestones = fs.readdirSync(archiveDir, { withFileTypes: true })
       .filter(e => e.isDirectory())
       .map(e => e.name);
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const result = {
     // Config
@@ -603,7 +593,7 @@ function cmdInitMapCodebase(cwd, raw) {
   let existingMaps = [];
   try {
     existingMaps = fs.readdirSync(codebaseDir).filter(f => f.endsWith('.md'));
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const result = {
     // Models
@@ -652,7 +642,7 @@ function cmdInitProgress(cwd, raw) {
       roadmapPhaseNums.add(hm[1]);
       roadmapPhaseNames.set(hm[1], hm[2].replace(/\(INSERTED\)/i, '').trim());
     }
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const isDirInMilestone = getMilestonePhaseFilter(cwd);
   const seenPhaseNums = new Set();
@@ -705,7 +695,7 @@ function cmdInitProgress(cwd, raw) {
         nextPhase = phaseInfo;
       }
     }
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   // Add phases defined in ROADMAP but not yet scaffolded to disk
   for (const [num, name] of roadmapPhaseNames) {
@@ -736,7 +726,7 @@ function cmdInitProgress(cwd, raw) {
     const state = fs.readFileSync(path.join(cwd, '.planning', 'STATE.md'), 'utf-8');
     const pauseMatch = state.match(/\*\*Paused At:\*\*\s*(.+)/);
     if (pauseMatch) pausedAt = pauseMatch[1].trim();
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const result = {
     // Models

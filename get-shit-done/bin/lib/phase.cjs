@@ -401,7 +401,7 @@ function cmdPhaseInsert(cwd, afterPhase, description, raw) {
       const dm = dir.match(decimalPattern);
       if (dm) existingDecimals.push(parseInt(dm[1], 10));
     }
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   const nextDecimal = existingDecimals.length === 0 ? 1 : Math.max(...existingDecimals) + 1;
   const decimalPhase = `${normalizedBase}.${nextDecimal}`;
@@ -470,7 +470,7 @@ function cmdPhaseRemove(cwd, targetPhase, options, raw) {
     const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
     const dirs = entries.filter(e => e.isDirectory()).map(e => e.name).sort((a, b) => comparePhaseNum(a, b));
     targetDir = dirs.find(d => d.startsWith(normalized + '-') || d === normalized);
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   // Check for executed work (SUMMARY.md files)
   if (targetDir && !force) {
@@ -538,7 +538,7 @@ function cmdPhaseRemove(cwd, targetPhase, options, raw) {
           }
         }
       }
-    } catch { /* intentionally empty */ }
+    } catch {}
 
   } else {
     // Integer removal: renumber all subsequent integer phases
@@ -598,7 +598,7 @@ function cmdPhaseRemove(cwd, targetPhase, options, raw) {
           }
         }
       }
-    } catch { /* intentionally empty */ }
+    } catch {}
   }
 
   // Update ROADMAP.md
@@ -818,7 +818,7 @@ function cmdPhaseComplete(cwd, phaseNum, raw) {
         }
       }
     }
-  } catch { /* intentionally empty */ }
+  } catch {}
 
   // Fallback: if filesystem found no next phase, check ROADMAP.md
   // for phases that are defined but not yet planned (no directory on disk)
@@ -835,7 +835,7 @@ function cmdPhaseComplete(cwd, phaseNum, raw) {
           break;
         }
       }
-    } catch { /* intentionally empty */ }
+    } catch {}
   }
 
   // Update STATE.md
