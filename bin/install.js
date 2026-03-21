@@ -3214,24 +3214,26 @@ function uninstall(isGlobal, runtime = 'claude') {
       }
     }
 
-    // Remove GSD hooks from PreToolUse (prompt injection guard)
-    if (settings.hooks && settings.hooks.PreToolUse) {
-      const before = settings.hooks.PreToolUse.length;
-      settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter(entry => {
-        if (entry.hooks && Array.isArray(entry.hooks)) {
-          const hasGsdHook = entry.hooks.some(h =>
-            h.command && h.command.includes('gsd-prompt-guard')
-          );
-          return !hasGsdHook;
+    // Remove GSD hooks from PreToolUse and BeforeTool (Gemini uses BeforeTool)
+    for (const eventName of ['PreToolUse', 'BeforeTool']) {
+      if (settings.hooks && settings.hooks[eventName]) {
+        const before = settings.hooks[eventName].length;
+        settings.hooks[eventName] = settings.hooks[eventName].filter(entry => {
+          if (entry.hooks && Array.isArray(entry.hooks)) {
+            const hasGsdHook = entry.hooks.some(h =>
+              h.command && h.command.includes('gsd-prompt-guard')
+            );
+            return !hasGsdHook;
+          }
+          return true;
+        });
+        if (settings.hooks[eventName].length < before) {
+          settingsModified = true;
+          console.log(`  ${green}✓${reset} Removed prompt injection guard hook from settings`);
         }
-        return true;
-      });
-      if (settings.hooks.PreToolUse.length < before) {
-        settingsModified = true;
-        console.log(`  ${green}✓${reset} Removed prompt injection guard hook from settings`);
-      }
-      if (settings.hooks.PreToolUse.length === 0) {
-        delete settings.hooks.PreToolUse;
+        if (settings.hooks[eventName].length === 0) {
+          delete settings.hooks[eventName];
+        }
       }
     }
 
@@ -4119,7 +4121,8 @@ function install(isGlobal, runtime = 'claude') {
     }
 
     // Configure PreToolUse hook for prompt injection detection
-    const preToolEvent = 'PreToolUse';
+    // Gemini and Antigravity use BeforeTool instead of PreToolUse for pre-tool hooks
+    const preToolEvent = (runtime === 'gemini' || runtime === 'antigravity') ? 'BeforeTool' : 'PreToolUse';
     if (!settings.hooks[preToolEvent]) {
       settings.hooks[preToolEvent] = [];
     }
