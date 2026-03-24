@@ -6,6 +6,11 @@ You are a thinking partner, not an interviewer. Analyze the codebase deeply, sur
 believe based on evidence, and ask the user only to correct what's wrong.
 </purpose>
 
+<available_agent_types>
+Valid GSD subagent types (use exact names — do not fall back to 'general-purpose'):
+- gsd-assumptions-analyzer — Analyzes codebase to surface implementation assumptions
+</available_agent_types>
+
 <downstream_awareness>
 **CONTEXT.md feeds into:**
 
@@ -61,6 +66,7 @@ Phase number from argument (required).
 ```bash
 INIT=$(node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" init phase-op "${PHASE}")
 if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
+AGENT_SKILLS_ANALYZER=$(node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" agent-skills gsd-assumptions-analyzer 2>/dev/null)
 ```
 
 Parse JSON for: `commit_docs`, `phase_found`, `phase_dir`, `phase_number`, `phase_name`,
@@ -265,6 +271,8 @@ Return EXACTLY this structure:
 ## Needs External Research
 [Topics where codebase alone is insufficient — library version compatibility,
 ecosystem best practices, etc. Leave empty if codebase provides enough evidence.]
+
+${AGENT_SKILLS_ANALYZER}
 """)
 ```
 
