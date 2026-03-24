@@ -1128,7 +1128,12 @@ function generateCodexAgentToml(agentName, agentContent) {
  * Generate the GSD config block for Codex config.toml.
  * @param {Array<{name: string, description: string}>} agents
  */
-function generateCodexConfigBlock(agents) {
+function generateCodexConfigBlock(agents, targetDir) {
+  // Use absolute paths when targetDir is provided — Codex ≥0.116 requires
+  // AbsolutePathBuf for config_file and cannot resolve relative paths.
+  const agentsPrefix = targetDir
+    ? path.join(targetDir, 'agents').replace(/\\/g, '/')
+    : 'agents';
   const lines = [
     GSD_CODEX_MARKER,
     '',
@@ -1137,7 +1142,7 @@ function generateCodexConfigBlock(agents) {
   for (const { name, description } of agents) {
     lines.push(`[agents.${name}]`);
     lines.push(`description = ${JSON.stringify(description)}`);
-    lines.push(`config_file = "agents/${name}.toml"`);
+    lines.push(`config_file = "${agentsPrefix}/${name}.toml"`);
     lines.push('');
   }
 
@@ -2124,7 +2129,21 @@ function ensureCodexHooksFeature(configContent) {
   if (!configContent) {
     return { content: featuresBlock, ownership: 'section' };
   }
-  return { content: featuresBlock + eol + configContent, ownership: 'section' };
+  // Insert [features] before the first table header, preserving bare top-level keys.
+  // Prepending would trap them under [features] where Codex expects only booleans (#1202).
+  const firstTableHeader = lineRecords.find(r => r.tableHeader);
+  if (firstTableHeader) {
+    const before = configContent.slice(0, firstTableHeader.start);
+    const after = configContent.slice(firstTableHeader.start);
+    const needsGap = before.length > 0 && !before.endsWith(eol + eol);
+    return {
+      content: before + (needsGap ? eol : '') + featuresBlock + eol + after,
+      ownership: 'section',
+    };
+  }
+  // No table headers — append [features] after top-level keys
+  const needsGap = configContent.length > 0 && !configContent.endsWith(eol + eol);
+  return { content: configContent + (needsGap ? eol : '') + featuresBlock, ownership: 'section' };
 }
 
 function hasEnabledCodexHooksFeature(configContent) {
@@ -2249,7 +2268,7 @@ function installCodexConfig(targetDir, agentsSrc) {
     fs.writeFileSync(path.join(agentsTomlDir, `${name}.toml`), tomlContent);
   }
 
-  const gsdBlock = generateCodexConfigBlock(agents);
+  const gsdBlock = generateCodexConfigBlock(agents, targetDir);
   mergeCodexConfig(configPath, gsdBlock);
 
   return agents.length;
@@ -3107,6 +3126,85 @@ function cleanupOrphanedHooks(settings) {
       'hooks$1gsd-statusline.js'
     );
     console.log(`  ${green}✓${reset} Updated statusline path (hooks/statusline.js → hooks/gsd-statusline.js)`);
+  }
+
+  return settings;
+}
+
+/**
+ * Validate hook field requirements to prevent silent settings.json rejection.
+ *
+ * Claude Code validates the entire settings file with a strict Zod schema.
+ * If ANY hook has an invalid schema (e.g., type: "agent" missing "prompt"),
+ * the ENTIRE settings.json is silently discarded — disabling all plugins,
+ * env vars, and other configuration.
+ *
+ * This defensive check removes invalid hook entries and cleans up empty
+ * event arrays to prevent this. It validates:
+ *   - agent hooks require a "prompt" field
+ *   - command hooks require a "command" field
+ *   - entries must have a valid "hooks" array (non-array/missing is removed)
+ *
+ * @param {object} settings - The settings object (mutated in place)
+ * @returns {object} The same settings object
+ */
+function validateHookFields(settings) {
+  if (!settings.hooks || typeof settings.hooks !== 'object') return settings;
+
+  let fixedHooks = false;
+  const emptyKeys = [];
+
+  for (const [eventType, hookEntries] of Object.entries(settings.hooks)) {
+    if (!Array.isArray(hookEntries)) continue;
+
+    // Pass 1: validate each entry, building a new array without mutation
+    const validated = [];
+    for (const entry of hookEntries) {
+      // Entries without a hooks sub-array are structurally invalid — remove them
+      if (!entry.hooks || !Array.isArray(entry.hooks)) {
+        fixedHooks = true;
+        continue;
+      }
+
+      // Filter invalid hooks within the entry
+      const validHooks = entry.hooks.filter(h => {
+        if (h.type === 'agent' && !h.prompt) {
+          fixedHooks = true;
+          return false;
+        }
+        if (h.type === 'command' && !h.command) {
+          fixedHooks = true;
+          return false;
+        }
+        return true;
+      });
+
+      // Drop entries whose hooks are now empty
+      if (validHooks.length === 0) {
+        fixedHooks = true;
+        continue;
+      }
+
+      // Build a clean copy instead of mutating the original entry
+      validated.push({ ...entry, hooks: validHooks });
+    }
+
+    settings.hooks[eventType] = validated;
+
+    // Collect empty event arrays for removal (avoid delete during iteration)
+    if (validated.length === 0) {
+      emptyKeys.push(eventType);
+      fixedHooks = true;
+    }
+  }
+
+  // Pass 2: remove empty event arrays
+  for (const key of emptyKeys) {
+    delete settings.hooks[key];
+  }
+
+  if (fixedHooks) {
+    console.log(`  ${green}✓${reset} Fixed invalid hook entries (prevents settings.json schema rejection)`);
   }
 
   return settings;
@@ -4268,7 +4366,7 @@ function install(isGlobal, runtime = 'claude') {
   // Gemini and Antigravity use AfterTool instead of PostToolUse for post-tool hooks
   const postToolEvent = (runtime === 'gemini' || runtime === 'antigravity') ? 'AfterTool' : 'PostToolUse';
   const settingsPath = path.join(targetDir, 'settings.json');
-  const settings = cleanupOrphanedHooks(readSettings(settingsPath));
+  const settings = validateHookFields(cleanupOrphanedHooks(readSettings(settingsPath)));
   const statuslineCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-statusline.js')
     : 'node ' + dirName + '/hooks/gsd-statusline.js';
@@ -4703,6 +4801,7 @@ if (process.env.GSD_TEST_MODE) {
     copyCommandsAsWindsurfSkills,
     writeManifest,
     reportLocalPatches,
+    validateHookFields,
   };
 } else {
 
