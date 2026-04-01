@@ -364,14 +364,78 @@ function resolveOpencodeConfigPath(configDir) {
 }
 
 /**
- * Read and parse settings.json, returning empty object if it doesn't exist
+ * Strip JSONC comments (// and /* *​/) from a string to produce valid JSON.
+ * Handles comments inside strings correctly (does not strip them).
+ */
+function stripJsonComments(text) {
+  let result = '';
+  let i = 0;
+  let inString = false;
+  let stringChar = '';
+  while (i < text.length) {
+    // Handle string literals — don't strip comments inside strings
+    if (inString) {
+      if (text[i] === '\\') {
+        result += text[i] + (text[i + 1] || '');
+        i += 2;
+        continue;
+      }
+      if (text[i] === stringChar) {
+        inString = false;
+      }
+      result += text[i];
+      i++;
+      continue;
+    }
+    // Start of string
+    if (text[i] === '"' || text[i] === "'") {
+      inString = true;
+      stringChar = text[i];
+      result += text[i];
+      i++;
+      continue;
+    }
+    // Line comment
+    if (text[i] === '/' && text[i + 1] === '/') {
+      // Skip to end of line
+      while (i < text.length && text[i] !== '\n') i++;
+      continue;
+    }
+    // Block comment
+    if (text[i] === '/' && text[i + 1] === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i += 2; // skip closing */
+      continue;
+    }
+    result += text[i];
+    i++;
+  }
+  // Remove trailing commas before } or ] (common in JSONC)
+  return result.replace(/,\s*([}\]])/g, '$1');
+}
+
+/**
+ * Read and parse settings.json, returning empty object if it doesn't exist.
+ * Supports JSONC (JSON with comments) — many CLI tools allow comments in
+ * their settings files, so we strip them before parsing to avoid silent
+ * data loss from JSON.parse failures.
  */
 function readSettings(settingsPath) {
   if (fs.existsSync(settingsPath)) {
     try {
-      return JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      const raw = fs.readFileSync(settingsPath, 'utf8');
+      // Try standard JSON first (fast path)
+      try {
+        return JSON.parse(raw);
+      } catch {
+        // Fall back to JSONC stripping
+        return JSON.parse(stripJsonComments(raw));
+      }
     } catch (e) {
-      return {};
+      // If even JSONC stripping fails, warn instead of silently returning {}
+      console.warn('  ' + yellow + '⚠' + reset + '  Warning: Could not parse ' + settingsPath + ' — file may be malformed. Existing settings preserved.');
+      return null;
     }
   }
   return {};
@@ -402,11 +466,11 @@ function getCommitAttribution(runtime) {
 
   if (runtime === 'opencode') {
     const config = readSettings(resolveOpencodeConfigPath(getGlobalDir('opencode', null)));
-    result = config.disable_ai_attribution === true ? null : undefined;
+    result = (config && config.disable_ai_attribution === true) ? null : undefined;
   } else if (runtime === 'gemini') {
     // Gemini: check gemini settings.json for attribution config
     const settings = readSettings(path.join(getGlobalDir('gemini', explicitConfigDir), 'settings.json'));
-    if (!settings.attribution || settings.attribution.commit === undefined) {
+    if (!settings || !settings.attribution || settings.attribution.commit === undefined) {
       result = undefined;
     } else if (settings.attribution.commit === '') {
       result = null;
@@ -416,7 +480,7 @@ function getCommitAttribution(runtime) {
   } else if (runtime === 'claude') {
     // Claude Code
     const settings = readSettings(path.join(getGlobalDir('claude', explicitConfigDir), 'settings.json'));
-    if (!settings.attribution || settings.attribution.commit === undefined) {
+    if (!settings || !settings.attribution || settings.attribution.commit === undefined) {
       result = undefined;
     } else if (settings.attribution.commit === '') {
       result = null;
@@ -3559,6 +3623,10 @@ function uninstall(isGlobal, runtime = 'claude') {
   const settingsPath = path.join(targetDir, 'settings.json');
   if (fs.existsSync(settingsPath)) {
     let settings = readSettings(settingsPath);
+    if (settings === null) {
+      console.log(`  ${yellow}i${reset} Skipping settings.json cleanup — file could not be parsed`);
+      settings = {}; // prevent downstream crashes, but don't write back
+    }
     let settingsModified = false;
 
     // Remove GSD statusline if it references our hook
@@ -4448,7 +4516,12 @@ function install(isGlobal, runtime = 'claude') {
   // Gemini and Antigravity use AfterTool instead of PostToolUse for post-tool hooks
   const postToolEvent = (runtime === 'gemini' || runtime === 'antigravity') ? 'AfterTool' : 'PostToolUse';
   const settingsPath = path.join(targetDir, 'settings.json');
-  const settings = validateHookFields(cleanupOrphanedHooks(readSettings(settingsPath)));
+  const rawSettings = readSettings(settingsPath);
+  if (rawSettings === null) {
+    console.log('  ' + yellow + 'i' + reset + '  Skipping settings.json configuration — file could not be parsed (comments or malformed JSON). Your existing settings are preserved.');
+    return;
+  }
+  const settings = validateHookFields(cleanupOrphanedHooks(rawSettings));
   const statuslineCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-statusline.js')
     : 'node ' + dirName + '/hooks/gsd-statusline.js';
