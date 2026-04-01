@@ -138,6 +138,10 @@ AGENT_SKILLS_VERIFIER=$(node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" age
 
 Parse JSON for: `planner_model`, `executor_model`, `checker_model`, `verifier_model`, `commit_docs`, `branch_name`, `quick_id`, `slug`, `date`, `timestamp`, `quick_dir`, `task_dir`, `roadmap_exists`, `planning_exists`.
 
+```bash
+USE_WORKTREES=$(node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" config-get workflow.use_worktrees 2>/dev/null || echo "true")
+```
+
 **If `roadmap_exists` is false:** Error — Quick mode requires an active project with ROADMAP.md. Run `/gsd:new-project` first.
 
 Quick tasks can run mid-phase - validation only checks ROADMAP.md exists, not phase status.
@@ -564,22 +568,37 @@ ${AGENT_SKILLS_EXECUTOR}
 
 <constraints>
 - Execute all tasks in the plan
-- Commit each task atomically
+- Commit each task atomically (code changes only)
 - Create summary at: ${QUICK_DIR}/${quick_id}-SUMMARY.md
+- Do NOT commit docs artifacts (SUMMARY.md, STATE.md, PLAN.md) — the orchestrator handles the docs commit in Step 8
 - Do NOT update ROADMAP.md (quick tasks are separate from planned phases)
 </constraints>
 ",
   subagent_type="gsd-executor",
   model="{executor_model}",
-  isolation="worktree",
+  ${USE_WORKTREES !== "false" ? 'isolation="worktree",' : ''}
   description="Execute: ${DESCRIPTION}"
 )
 ```
 
 After executor returns:
-1. Verify summary exists at `${QUICK_DIR}/${quick_id}-SUMMARY.md`
-2. Extract commit hash from executor output
-3. Report completion status
+1. **Worktree cleanup:** If the executor ran with `isolation="worktree"`, merge the worktree branch back and clean up:
+   ```bash
+   # Find worktrees created by the executor
+   WORKTREES=$(git worktree list --porcelain | grep "^worktree " | grep -v "$(pwd)$" | sed 's/^worktree //')
+   for WT in $WORKTREES; do
+     WT_BRANCH=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null)
+     if [ -n "$WT_BRANCH" ] && [ "$WT_BRANCH" != "HEAD" ]; then
+       git merge "$WT_BRANCH" --no-edit -m "chore: merge quick task worktree ($WT_BRANCH)" 2>&1 || echo "⚠ Merge conflict — resolve manually"
+       git worktree remove "$WT" --force 2>/dev/null || true
+       git branch -D "$WT_BRANCH" 2>/dev/null || true
+     fi
+   done
+   ```
+   If `workflow.use_worktrees` is `false`, skip this step.
+2. Verify summary exists at `${QUICK_DIR}/${quick_id}-SUMMARY.md`
+3. Extract commit hash from executor output
+4. Report completion status
 
 **Known Claude Code bug (classifyHandoffIfNeeded):** If executor reports "failed" with error `classifyHandoffIfNeeded is not defined`, this is a Claude Code runtime bug — not a real failure. Check if summary file exists and git log shows commits. If so, treat as successful.
 
@@ -693,7 +712,7 @@ Use Edit tool to make these changes atomically
 
 **Step 8: Final commit and completion**
 
-Stage and commit quick task artifacts:
+Stage and commit quick task artifacts. This step MUST always run — even if the executor already committed some files (e.g. when running without worktree isolation). The `gsd-tools commit` command handles already-committed files gracefully.
 
 Build file list:
 - `${QUICK_DIR}/${quick_id}-PLAN.md`
@@ -704,6 +723,9 @@ Build file list:
 - If `$VALIDATE_MODE` and verification file exists: `${QUICK_DIR}/${quick_id}-VERIFICATION.md`
 
 ```bash
+# Explicitly stage all artifacts before commit — PLAN.md may be untracked
+# if the executor ran without worktree isolation and committed docs early
+git add ${file_list} 2>/dev/null
 node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" commit "docs(quick-${quick_id}): ${DESCRIPTION}" --files ${file_list}
 ```
 

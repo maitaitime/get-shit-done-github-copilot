@@ -736,7 +736,7 @@
 **Requirements:**
 - REQ-TODO-01: System MUST capture todo from current conversation context
 - REQ-TODO-02: Todos MUST be stored in `.planning/todos/pending/`
-- REQ-TODO-03: Completed todos MUST move to `.planning/todos/done/`
+- REQ-TODO-03: Completed todos MUST move to `.planning/todos/completed/`
 - REQ-TODO-04: Check-todos MUST list all pending items with selection to work on one
 
 ---
@@ -1015,9 +1015,9 @@ When verification returns `human_needed`, items are persisted as a trackable HUM
 
 ### 42. Cross-AI Peer Review
 
-**Command:** `/gsd:review --phase N [--gemini] [--claude] [--codex] [--all]`
+**Command:** `/gsd:review --phase N [--gemini] [--claude] [--codex] [--coderabbit] [--all]`
 
-**Purpose:** Invoke external AI CLIs (Gemini, Claude, Codex) to independently review phase plans. Produces structured REVIEWS.md with per-reviewer feedback.
+**Purpose:** Invoke external AI CLIs (Gemini, Claude, Codex, CodeRabbit) to independently review phase plans. Produces structured REVIEWS.md with per-reviewer feedback.
 
 **Requirements:**
 - REQ-REVIEW-01: System MUST detect available AI CLIs on the system
