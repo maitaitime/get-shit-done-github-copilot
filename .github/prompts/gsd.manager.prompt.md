@@ -5,7 +5,8 @@ tools: ['agent', 'edit', 'execute', 'read', 'search', 'vscode/askQuestions']
 agent: agent
 ---
 
-<!-- upstream-tools: ["Read","Write","Bash","Glob","Grep","AskUserQuestion","Task"] -->
+<!-- upstream-tools: ["Read","Write","Bash","Glob","Grep","AskUserQuestion","Skill","Task"] -->
+<!-- omitted-tools: ["skill"] — no Copilot equivalent found -->
 
 ## Copilot Runtime Adapter (important)
 
