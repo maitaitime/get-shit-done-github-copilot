@@ -1121,7 +1121,7 @@ function convertClaudeAgentToCursorAgent(content) {
 }
 
 // --- Windsurf converters ---
-// Windsurf (by Codeium) uses a tool set similar to Cursor (both VS Code-based).
+// Windsurf uses a tool set similar to Cursor.
 // Config lives in .windsurf/ (local) and ~/.windsurf/ (global).
 
 // Tool name mapping from Claude Code to Windsurf Cascade
@@ -1239,7 +1239,7 @@ function convertClaudeAgentToWindsurfAgent(content) {
 }
 
 // --- Augment converters ---
-// Augment (auggie CLI) uses a tool set similar to Cursor/Windsurf (VS Code-based).
+// Augment uses a tool set similar to Cursor/Windsurf.
 // Config lives in .augment/ (local) and ~/.augment/ (global).
 
 const claudeToAugmentTools = {
@@ -2990,7 +2990,7 @@ function convertClaudeToOpencodeFrontmatter(content, { isAgent = false } = {}) {
   convertedContent = convertedContent.replace(/\bAskUserQuestion\b/g, 'question');
   convertedContent = convertedContent.replace(/\bSlashCommand\b/g, 'skill');
   convertedContent = convertedContent.replace(/\bTodoWrite\b/g, 'todowrite');
-  // Replace /gsd:command with /gsd-command for opencode (flat command structure)
+  // Replace /gsd-command colon variant with /gsd-command for opencode (flat command structure)
   convertedContent = convertedContent.replace(/\/gsd:/g, '/gsd-');
   // Replace ~/.claude and $HOME/.claude with OpenCode's config location
   convertedContent = convertedContent.replace(/~\/\.claude\b/g, '~/.config/opencode');
@@ -3134,14 +3134,14 @@ function convertClaudeToOpencodeFrontmatter(content, { isAgent = false } = {}) {
   return `---\n${newFrontmatter}\n---${body}`;
 }
 
-// Kilo CLI — fork of OpenCode, same conversion logic, different config paths.
+// Kilo CLI — same conversion logic as OpenCode, different config paths.
 function convertClaudeToKiloFrontmatter(content, { isAgent = false } = {}) {
   // Replace tool name references in content (applies to all files)
   let convertedContent = content;
   convertedContent = convertedContent.replace(/\bAskUserQuestion\b/g, 'question');
   convertedContent = convertedContent.replace(/\bSlashCommand\b/g, 'skill');
   convertedContent = convertedContent.replace(/\bTodoWrite\b/g, 'todowrite');
-  // Replace /gsd:command with /gsd-command for Kilo (flat command structure)
+  // Replace /gsd-command colon variant with /gsd-command for Kilo (flat command structure)
   convertedContent = convertedContent.replace(/\/gsd:/g, '/gsd-');
   // Replace ~/.claude and $HOME/.claude with Kilo's config location
   convertedContent = convertedContent.replace(/~\/\.claude\b/g, '~/.config/kilo');
@@ -4260,40 +4260,6 @@ function uninstall(isGlobal, runtime = 'claude') {
         console.log(`  ${green}✓${reset} Removed ${skillCount} Antigravity skills`);
       }
     }
-  } else if (isCursor) {
-    // Cursor: remove skills/gsd-*/ directories (same layout as Codex skills)
-    const skillsDir = path.join(targetDir, 'skills');
-    if (fs.existsSync(skillsDir)) {
-      let skillCount = 0;
-      const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && entry.name.startsWith('gsd-')) {
-          fs.rmSync(path.join(skillsDir, entry.name), { recursive: true });
-          skillCount++;
-        }
-      }
-      if (skillCount > 0) {
-        removedCount++;
-        console.log(`  ${green}✓${reset} Removed ${skillCount} Cursor skills`);
-      }
-    }
-  } else if (isWindsurf) {
-    // Windsurf: remove skills/gsd-*/ directories (same layout as Cursor skills)
-    const skillsDir = path.join(targetDir, 'skills');
-    if (fs.existsSync(skillsDir)) {
-      let skillCount = 0;
-      const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && entry.name.startsWith('gsd-')) {
-          fs.rmSync(path.join(skillsDir, entry.name), { recursive: true });
-          skillCount++;
-        }
-      }
-      if (skillCount > 0) {
-        removedCount++;
-        console.log(`  ${green}✓${reset} Removed ${skillCount} Windsurf skills`);
-      }
-    }
   } else if (isGemini) {
     // Gemini: still uses commands/gsd/
     const gsdCommandsDir = path.join(targetDir, 'commands', 'gsd');
@@ -4403,7 +4369,7 @@ function uninstall(isGlobal, runtime = 'claude') {
   // 4. Remove GSD hooks
   const hooksDir = path.join(targetDir, 'hooks');
   if (fs.existsSync(hooksDir)) {
-    const gsdHooks = ['gsd-statusline.js', 'gsd-check-update.js', 'gsd-check-update.sh', 'gsd-context-monitor.js', 'gsd-prompt-guard.js', 'gsd-read-guard.js', 'gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh'];
+    const gsdHooks = ['gsd-statusline.js', 'gsd-check-update.js', 'gsd-context-monitor.js', 'gsd-prompt-guard.js', 'gsd-read-guard.js', 'gsd-workflow-guard.js', 'gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh'];
     let hookCount = 0;
     for (const hook of gsdHooks) {
       const hookPath = path.join(hooksDir, hook);
@@ -4452,73 +4418,36 @@ function uninstall(isGlobal, runtime = 'claude') {
       console.log(`  ${green}✓${reset} Removed GSD statusline from settings`);
     }
 
-    // Remove GSD hooks from SessionStart
-    if (settings.hooks && settings.hooks.SessionStart) {
-      const before = settings.hooks.SessionStart.length;
-      settings.hooks.SessionStart = settings.hooks.SessionStart.filter(entry => {
-        if (entry.hooks && Array.isArray(entry.hooks)) {
-          // Filter out GSD hooks
-          const hasGsdHook = entry.hooks.some(h =>
-            h.command && (h.command.includes('gsd-check-update') || h.command.includes('gsd-statusline'))
-          );
-          return !hasGsdHook;
-        }
-        return true;
-      });
-      if (settings.hooks.SessionStart.length < before) {
-        settingsModified = true;
-        console.log(`  ${green}✓${reset} Removed GSD hooks from settings`);
-      }
-      // Clean up empty array
-      if (settings.hooks.SessionStart.length === 0) {
-        delete settings.hooks.SessionStart;
-      }
-    }
+    // Remove GSD hooks from settings — per-hook granularity to preserve
+    // user hooks that share an entry with a GSD hook (#1755 followup)
+    const isGsdHookCommand = (cmd) =>
+      cmd && (cmd.includes('gsd-check-update') || cmd.includes('gsd-statusline') ||
+        cmd.includes('gsd-session-state') || cmd.includes('gsd-context-monitor') ||
+        cmd.includes('gsd-phase-boundary') || cmd.includes('gsd-prompt-guard') ||
+        cmd.includes('gsd-read-guard') || cmd.includes('gsd-validate-commit') ||
+        cmd.includes('gsd-workflow-guard'));
 
-    // Remove GSD hooks from PostToolUse and AfterTool (Gemini uses AfterTool)
-    for (const eventName of ['PostToolUse', 'AfterTool']) {
+    for (const eventName of ['SessionStart', 'PostToolUse', 'AfterTool', 'PreToolUse', 'BeforeTool']) {
       if (settings.hooks && settings.hooks[eventName]) {
-        const before = settings.hooks[eventName].length;
-        settings.hooks[eventName] = settings.hooks[eventName].filter(entry => {
-          if (entry.hooks && Array.isArray(entry.hooks)) {
-            const hasGsdHook = entry.hooks.some(h =>
-              h.command && h.command.includes('gsd-context-monitor')
-            );
-            return !hasGsdHook;
-          }
-          return true;
-        });
-        if (settings.hooks[eventName].length < before) {
+        const before = JSON.stringify(settings.hooks[eventName]);
+        settings.hooks[eventName] = settings.hooks[eventName]
+          .map(entry => {
+            if (!entry.hooks || !Array.isArray(entry.hooks)) return null;
+            // Filter out individual GSD hooks, keep user hooks
+            entry.hooks = entry.hooks.filter(h => !isGsdHookCommand(h.command));
+            return entry.hooks.length > 0 ? entry : null;
+          })
+          .filter(Boolean);
+        if (JSON.stringify(settings.hooks[eventName]) !== before) {
           settingsModified = true;
-          console.log(`  ${green}✓${reset} Removed context monitor hook from settings`);
         }
         if (settings.hooks[eventName].length === 0) {
           delete settings.hooks[eventName];
         }
       }
     }
-
-    // Remove GSD hooks from PreToolUse and BeforeTool (Gemini uses BeforeTool)
-    for (const eventName of ['PreToolUse', 'BeforeTool']) {
-      if (settings.hooks && settings.hooks[eventName]) {
-        const before = settings.hooks[eventName].length;
-        settings.hooks[eventName] = settings.hooks[eventName].filter(entry => {
-          if (entry.hooks && Array.isArray(entry.hooks)) {
-            const hasGsdHook = entry.hooks.some(h =>
-              h.command && (h.command.includes('gsd-prompt-guard') || h.command.includes('gsd-read-guard'))
-            );
-            return !hasGsdHook;
-          }
-          return true;
-        });
-        if (settings.hooks[eventName].length < before) {
-          settingsModified = true;
-          console.log(`  ${green}✓${reset} Removed GSD pre-tool guard hooks from settings`);
-        }
-        if (settings.hooks[eventName].length === 0) {
-          delete settings.hooks[eventName];
-        }
-      }
+    if (settingsModified) {
+      console.log(`  ${green}✓${reset} Removed GSD hooks from settings`);
     }
 
     // Clean up empty hooks object
@@ -4971,7 +4900,7 @@ function writeManifest(configDir, runtime = 'claude') {
     const hooksDir = path.join(configDir, 'hooks');
     if (fs.existsSync(hooksDir)) {
       for (const file of fs.readdirSync(hooksDir)) {
-        if (file.startsWith('gsd-') && file.endsWith('.js')) {
+        if (file.startsWith('gsd-') && (file.endsWith('.js') || file.endsWith('.sh'))) {
           manifest.files['hooks/' + file] = fileHash(path.join(hooksDir, file));
         }
       }
@@ -5392,11 +5321,22 @@ function install(isGlobal, runtime = 'claude') {
             try { fs.chmodSync(destFile, 0o755); } catch (e) { /* Windows doesn't support chmod */ }
           } else {
             fs.copyFileSync(srcFile, destFile);
+            // Ensure .sh hook files are executable (mirrors chmod in build-hooks.js)
+            if (entry.endsWith('.sh')) {
+              try { fs.chmodSync(destFile, 0o755); } catch (e) { /* Windows doesn't support chmod */ }
+            }
           }
         }
       }
       if (verifyInstalled(hooksDest, 'hooks')) {
         console.log(`  ${green}✓${reset} Installed hooks (bundled)`);
+        // Warn if expected community .sh hooks are missing (non-fatal)
+        const expectedShHooks = ['gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh'];
+        for (const sh of expectedShHooks) {
+          if (!fs.existsSync(path.join(hooksDest, sh))) {
+            console.warn(`  ${yellow}⚠${reset}  Missing expected hook: ${sh}`);
+          }
+        }
       } else {
         failures.push('hooks');
       }
@@ -5404,8 +5344,8 @@ function install(isGlobal, runtime = 'claude') {
   }
 
   // Clear stale update cache so next session re-evaluates hook versions
-  // targetDir is e.g. ~/.claude/get-shit-done/, parent is the config dir
-  const updateCacheFile = path.join(path.dirname(targetDir), 'cache', 'gsd-update-check.json');
+  // Cache lives at ~/.cache/gsd/ (see hooks/gsd-check-update.js line 35-36)
+  const updateCacheFile = path.join(os.homedir(), '.cache', 'gsd', 'gsd-update-check.json');
   try { fs.unlinkSync(updateCacheFile); } catch (e) { /* cache may not exist yet */ }
 
   if (failures.length > 0) {
@@ -5484,14 +5424,21 @@ function install(isGlobal, runtime = 'claude') {
       configContent = setManagedCodexHooksOwnership(codexHooksFeature.content, codexHooksFeature.ownership);
 
       // Add SessionStart hook for update checking
-      const updateCheckScript = path.resolve(targetDir, 'get-shit-done', 'hooks', 'gsd-update-check.js').replace(/\\/g, '/');
+      const updateCheckScript = path.resolve(targetDir, 'hooks', 'gsd-check-update.js').replace(/\\/g, '/');
       const hookBlock =
         `${eol}# GSD Hooks${eol}` +
         `[[hooks]]${eol}` +
         `event = "SessionStart"${eol}` +
         `command = "node ${updateCheckScript}"${eol}`;
 
-      if (hasEnabledCodexHooksFeature(configContent) && !configContent.includes('gsd-update-check')) {
+      // Migrate legacy gsd-update-check entries from prior installs (#1755 followup)
+      // Remove stale hook blocks that used the inverted filename or wrong path
+      if (configContent.includes('gsd-update-check')) {
+        configContent = configContent.replace(/\n# GSD Hooks\n\[\[hooks\]\]\nevent = "SessionStart"\ncommand = "node [^\n]*gsd-update-check\.js"\n/g, '\n');
+        configContent = configContent.replace(/\r\n# GSD Hooks\r\n\[\[hooks\]\]\r\nevent = "SessionStart"\r\ncommand = "node [^\r\n]*gsd-update-check\.js"\r\n/g, '\r\n');
+      }
+
+      if (hasEnabledCodexHooksFeature(configContent) && !configContent.includes('gsd-check-update')) {
         configContent += hookBlock;
       }
 
@@ -5688,6 +5635,30 @@ function install(isGlobal, runtime = 'claude') {
     // and exits silently (no-op) if not enabled. This lets users enable
     // them per-project by adding: "hooks": { "community": true }
 
+    // Configure workflow guard hook (opt-in via hooks.workflow_guard: true)
+    // Detects file edits outside GSD workflow context and advises using
+    // /gsd-quick or /gsd-fast for state-tracked changes. Advisory only.
+    const workflowGuardCommand = isGlobal
+      ? buildHookCommand(targetDir, 'gsd-workflow-guard.js')
+      : 'node ' + dirName + '/hooks/gsd-workflow-guard.js';
+    const hasWorkflowGuardHook = settings.hooks[preToolEvent].some(entry =>
+      entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-workflow-guard'))
+    );
+
+    if (!hasWorkflowGuardHook) {
+      settings.hooks[preToolEvent].push({
+        matcher: 'Write|Edit',
+        hooks: [
+          {
+            type: 'command',
+            command: workflowGuardCommand,
+            timeout: 5
+          }
+        ]
+      });
+      console.log(`  ${green}✓${reset} Configured workflow guard hook (opt-in via hooks.workflow_guard)`);
+    }
+
     // Configure commit validation hook (Conventional Commits enforcement, opt-in)
     const validateCommitCommand = isGlobal
       ? 'bash ' + targetDir.replace(/\\/g, '/') + '/hooks/gsd-validate-commit.sh'
@@ -5824,7 +5795,7 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
   if (runtime === 'augment') program = 'Augment';
   if (runtime === 'trae') program = 'Trae';
 
-  let command = '/gsd:new-project';
+  let command = '/gsd-new-project';
   if (runtime === 'opencode') command = '/gsd-new-project';
   if (runtime === 'kilo') command = '/gsd-new-project';
   if (runtime === 'codex') command = '$gsd-new-project';
