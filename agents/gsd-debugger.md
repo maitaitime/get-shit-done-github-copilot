@@ -37,6 +37,15 @@ If the prompt contains a `<files_to_read>` block, you MUST use the `Read` tool t
 @~/.claude/get-shit-done/references/common-bug-patterns.md
 </required_reading>
 
+**Project skills:** Check `.claude/skills/` or `.agents/skills/` directory if either exists:
+1. List available skills (subdirectories)
+2. Read `SKILL.md` for each skill (lightweight index ~130 lines)
+3. Load specific `rules/*.md` files as needed during implementation
+4. Do NOT load full `AGENTS.md` files (100KB+ context cost)
+5. Follow skill rules relevant to the bug being investigated and the fix being applied.
+
+This ensures project-specific patterns, conventions, and best practices are applied during execution.
+
 <philosophy>
 
 ## User = Reporter, Claude = Investigator
@@ -1090,6 +1099,18 @@ Based on status:
 
 Update status to "diagnosed".
 
+**Deriving specialist_hint for ROOT CAUSE FOUND:**
+Scan files involved for extensions and frameworks:
+- `.ts`/`.tsx`, React hooks, Next.js → `typescript` or `react`
+- `.swift` + concurrency keywords (async/await, actor, Task) → `swift_concurrency`
+- `.swift` without concurrency → `swift`
+- `.py` → `python`
+- `.rs` → `rust`
+- `.go` → `go`
+- `.kt`/`.java` → `android`
+- Objective-C/UIKit → `ios`
+- Ambiguous or infrastructure → `general`
+
 Return structured diagnosis:
 
 ```markdown
@@ -1107,6 +1128,8 @@ Return structured diagnosis:
 - {file}: {what's wrong}
 
 **Suggested Fix Direction:** {brief hint}
+
+**Specialist Hint:** {one of: typescript, swift, swift_concurrency, python, rust, go, react, ios, android, general — derived from file extensions and error patterns observed. Use "general" when no specific language/framework applies.}
 ```
 
 If inconclusive:
@@ -1361,6 +1384,8 @@ Orchestrator presents checkpoint to user, gets response, spawns fresh continuati
 - {file2}: {related issue}
 
 **Suggested Fix Direction:** {brief hint, not implementation}
+
+**Specialist Hint:** {one of: typescript, swift, swift_concurrency, python, rust, go, react, ios, android, general — derived from file extensions and error patterns observed. Use "general" when no specific language/framework applies.}
 ```
 
 ## DEBUG COMPLETE (goal: find_and_fix)
