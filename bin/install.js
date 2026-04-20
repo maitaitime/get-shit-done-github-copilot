@@ -1006,9 +1006,15 @@ function convertClaudeToAntigravityContent(content, isGlobal = false) {
   if (isGlobal) {
     c = c.replace(/\$HOME\/\.claude\//g, '$HOME/.gemini/antigravity/');
     c = c.replace(/~\/\.claude\//g, '~/.gemini/antigravity/');
+    // Bare form (no trailing slash) — must come after slash form to avoid double-replace
+    c = c.replace(/\$HOME\/\.claude\b/g, '$HOME/.gemini/antigravity');
+    c = c.replace(/~\/\.claude\b/g, '~/.gemini/antigravity');
   } else {
     c = c.replace(/\$HOME\/\.claude\//g, '.agent/');
     c = c.replace(/~\/\.claude\//g, '.agent/');
+    // Bare form (no trailing slash) — must come after slash form to avoid double-replace
+    c = c.replace(/\$HOME\/\.claude\b/g, '.agent');
+    c = c.replace(/~\/\.claude\b/g, '.agent');
   }
   c = c.replace(/\.\/\.claude\//g, './.agent/');
   c = c.replace(/\.claude\//g, '.agent/');
@@ -5459,9 +5465,12 @@ function install(isGlobal, runtime = 'claude') {
   // For global installs: use $HOME/ so paths expand correctly inside double-quoted
   // shell commands (~ does NOT expand inside double quotes, causing MODULE_NOT_FOUND).
   // For local installs: use resolved absolute path (may be outside $HOME).
+  // Exception: OpenCode on Windows does not expand $HOME in @file references —
+  // use the absolute path instead so @$HOME/... references resolve correctly (#2376).
   const resolvedTarget = path.resolve(targetDir).replace(/\\/g, '/');
   const homeDir = os.homedir().replace(/\\/g, '/');
-  const pathPrefix = isGlobal && resolvedTarget.startsWith(homeDir)
+  const isWindowsHost = process.platform === 'win32';
+  const pathPrefix = isGlobal && resolvedTarget.startsWith(homeDir) && !(isOpencode && isWindowsHost)
     ? '$HOME' + resolvedTarget.slice(homeDir.length) + '/'
     : `${resolvedTarget}/`;
 
@@ -6785,6 +6794,26 @@ function installSdkIfNeeded() {
   if (globalResult.status !== 0) {
     emitSdkFatal('Failed to `npm install -g .` from sdk/.', { globalBin: null, exitCode: 1 });
   }
+
+  // 3a. Explicitly chmod dist/cli.js to 0o755 in the global install location.
+  // `tsc` emits files at process umask (typically 0o644 — non-executable), and
+  // `npm install -g` from a local directory does NOT chmod bin-script targets the
+  // way tarball extraction does. Without this, the `gsd-sdk` bin symlink points at
+  // a non-executable file and `command -v gsd-sdk` fails on every first install
+  // (root cause of #2453). Mirrors the pattern used for hook files in this installer.
+  try {
+    const prefixRes = spawnSync(npmCmd, ['config', 'get', 'prefix'], { encoding: 'utf-8' });
+    if (prefixRes.status === 0) {
+      const npmPrefix = (prefixRes.stdout || '').trim();
+      const sdkPkg = JSON.parse(fs.readFileSync(path.join(sdkDir, 'package.json'), 'utf-8'));
+      const sdkName = sdkPkg.name; // '@gsd-build/sdk'
+      const globalModulesDir = process.platform === 'win32'
+        ? path.join(npmPrefix, 'node_modules')
+        : path.join(npmPrefix, 'lib', 'node_modules');
+      const cliPath = path.join(globalModulesDir, sdkName, 'dist', 'cli.js');
+      try { fs.chmodSync(cliPath, 0o755); } catch (e) { /* Windows / path not found */ }
+    }
+  } catch (e) { /* Non-fatal: PATH verification in step 4 will catch any real failure */ }
 
   // 4. Verify gsd-sdk is actually resolvable on PATH. npm's global bin dir is
   //    not always on the current shell's PATH (Homebrew prefixes, nvm setups,
