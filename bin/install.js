@@ -877,14 +877,18 @@ function convertCopilotToolName(claudeTool) {
  */
 function convertClaudeToCopilotContent(content, isGlobal = false) {
   let c = content;
-  // CONV-06: Path replacement — most specific first to avoid substring matches
+  // CONV-06: Path replacement — most specific first to avoid substring matches.
+  // Handle both `~/.claude/foo` (trailing slash) and bare `~/.claude` forms in
+  // one pass via a capture group, matching the approach used by Antigravity,
+  // OpenCode, Kilo, and Codex converters (issue #2545).
   if (isGlobal) {
-    c = c.replace(/\$HOME\/\.claude\//g, '$HOME/.copilot/');
-    c = c.replace(/~\/\.claude\//g, '~/.copilot/');
+    c = c.replace(/\$HOME\/\.claude(\/|\b)/g, '$HOME/.copilot$1');
+    c = c.replace(/~\/\.claude(\/|\b)/g, '~/.copilot$1');
   } else {
     c = c.replace(/\$HOME\/\.claude\//g, '.github/');
     c = c.replace(/~\/\.claude\//g, '.github/');
-    c = c.replace(/~\/\.claude\n/g, '.github/');
+    c = c.replace(/\$HOME\/\.claude\b/g, '.github');
+    c = c.replace(/~\/\.claude\b/g, '.github');
   }
   c = c.replace(/\.\/\.claude\//g, './.github/');
   c = c.replace(/\.claude\//g, '.github/');
@@ -6075,9 +6079,13 @@ function install(isGlobal, runtime = 'claude') {
     return;
   }
   const settings = validateHookFields(cleanupOrphanedHooks(rawSettings));
-  // Local installs anchor paths to $CLAUDE_PROJECT_DIR so hooks resolve
-  // correctly regardless of the shell's current working directory (#1906).
-  const localPrefix = '"$CLAUDE_PROJECT_DIR"/' + dirName;
+  // Local installs anchor hook paths so they resolve regardless of cwd (#1906).
+  // Claude Code sets $CLAUDE_PROJECT_DIR; Gemini/Antigravity do not — and on
+  // Windows their own substitution logic doubles the path (#2557). Those runtimes
+  // run project hooks with the project dir as cwd, so bare relative paths work.
+  const localPrefix = (runtime === 'gemini' || runtime === 'antigravity')
+    ? dirName
+    : '"$CLAUDE_PROJECT_DIR"/' + dirName;
   const hookOpts = { portableHooks: hasPortableHooks };
   const statuslineCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-statusline.js', hookOpts)
