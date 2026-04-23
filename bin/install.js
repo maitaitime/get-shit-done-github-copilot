@@ -57,6 +57,20 @@ const claudeToCopilotTools = {
 // Get version from package.json
 const pkg = require('../package.json');
 
+// #2517 — runtime-aware tier resolution shared with core.cjs.
+// Hoisted to top with absolute __dirname-based paths so `gsd install codex` works
+// when invoked via npm global install (cwd is the user's project, not the gsd repo
+// root). Inline `require('../get-shit-done/...')` from inside install functions
+// works only because Node resolves it relative to the install.js file regardless
+// of cwd, but keeping the require at the top makes the dependency explicit and
+// surfaces resolution failures at process start instead of at first install call.
+const _gsdLibDir = path.join(__dirname, '..', 'get-shit-done', 'bin', 'lib');
+const { MODEL_PROFILES: GSD_MODEL_PROFILES } = require(path.join(_gsdLibDir, 'model-profiles.cjs'));
+const {
+  RUNTIME_PROFILE_MAP: GSD_RUNTIME_PROFILE_MAP,
+  resolveTierEntry: gsdResolveTierEntry,
+} = require(path.join(_gsdLibDir, 'core.cjs'));
+
 // Parse args
 const args = process.argv.slice(2);
 const hasGlobal = args.includes('--global') || args.includes('-g');
@@ -618,6 +632,115 @@ function readGsdGlobalModelOverrides() {
   } catch {
     return null;
   }
+}
+
+/**
+ * #2517 — Read a single GSD config file (defaults.json or per-project
+ * config.json) into a plain object, returning null on missing/empty files
+ * and warning to stderr on JSON parse failures so silent corruption can't
+ * mask broken configs (review finding #5).
+ */
+function _readGsdConfigFile(absPath, label) {
+  if (!fs.existsSync(absPath)) return null;
+  let raw;
+  try {
+    raw = fs.readFileSync(absPath, 'utf-8');
+  } catch (err) {
+    process.stderr.write(`gsd: warning — could not read ${label} (${absPath}): ${err.message}\n`);
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    process.stderr.write(`gsd: warning — invalid JSON in ${label} (${absPath}): ${err.message}\n`);
+    return null;
+  }
+}
+
+/**
+ * #2517 — Build a runtime-aware tier resolver for the install path.
+ *
+ * Probes BOTH per-project `<targetDir>/.planning/config.json` AND
+ * `~/.gsd/defaults.json`, with per-project keys winning over global. This
+ * matches `loadConfig`'s precedence and is the only way the PR's headline claim
+ * — "set runtime in .planning/config.json and the Codex TOML emit picks it up"
+ * — actually holds end-to-end (review finding #1).
+ *
+ * `targetDir` should be the consuming runtime's install root — install code
+ * passes `path.dirname(<runtime root>)` so `.planning/config.json` resolves
+ * relative to the user's project. When `targetDir` is null/undefined, only the
+ * global defaults are consulted.
+ *
+ * Returns null if no `runtime` is configured (preserves prior behavior — only
+ * model_overrides is embedded, no tier/reasoning-effort inference). Returns
+ * null when `model_profile` is `inherit` so the literal alias passes through
+ * unchanged.
+ *
+ * Returns { runtime, resolve(agentName) -> { model, reasoning_effort? } | null }
+ */
+function readGsdRuntimeProfileResolver(targetDir = null) {
+  const homeDefaults = _readGsdConfigFile(
+    path.join(os.homedir(), '.gsd', 'defaults.json'),
+    '~/.gsd/defaults.json'
+  );
+
+  // Per-project config probe. Resolve the project root by walking up from
+  // targetDir until we hit a `.planning/` directory; this covers both the
+  // common case (caller passes the project root) and the case where caller
+  // passes a nested install dir like `<root>/.codex/`.
+  let projectConfig = null;
+  if (targetDir) {
+    let probeDir = path.resolve(targetDir);
+    for (let depth = 0; depth < 8; depth += 1) {
+      const candidate = path.join(probeDir, '.planning', 'config.json');
+      if (fs.existsSync(candidate)) {
+        projectConfig = _readGsdConfigFile(candidate, '.planning/config.json');
+        break;
+      }
+      const parent = path.dirname(probeDir);
+      if (parent === probeDir) break;
+      probeDir = parent;
+    }
+  }
+
+  // Per-project wins. Only fall back to ~/.gsd/defaults.json when the project
+  // didn't set the field. Field-level merge (not whole-object replace) so a
+  // user can keep `runtime` global while overriding only `model_profile` per
+  // project, and vice versa.
+  const merged = {
+    runtime:
+      (projectConfig && projectConfig.runtime) ||
+      (homeDefaults && homeDefaults.runtime) ||
+      null,
+    model_profile:
+      (projectConfig && projectConfig.model_profile) ||
+      (homeDefaults && homeDefaults.model_profile) ||
+      'balanced',
+    model_profile_overrides:
+      (projectConfig && projectConfig.model_profile_overrides) ||
+      (homeDefaults && homeDefaults.model_profile_overrides) ||
+      null,
+  };
+
+  if (!merged.runtime) return null;
+
+  const profile = String(merged.model_profile).toLowerCase();
+  if (profile === 'inherit') return null;
+
+  return {
+    runtime: merged.runtime,
+    resolve(agentName) {
+      const agentModels = GSD_MODEL_PROFILES[agentName];
+      if (!agentModels) return null;
+      const tier = agentModels[profile] || agentModels.balanced;
+      if (!tier) return null;
+      return gsdResolveTierEntry({
+        runtime: merged.runtime,
+        tier,
+        overrides: merged.model_profile_overrides,
+      });
+    },
+  };
 }
 
 // Cache for attribution settings (populated once per runtime during install)
@@ -1789,7 +1912,7 @@ purpose: ${toSingleLine(description)}
  * Sets required agent metadata, sandbox_mode, and developer_instructions
  * from the agent markdown content.
  */
-function generateCodexAgentToml(agentName, agentContent, modelOverrides = null) {
+function generateCodexAgentToml(agentName, agentContent, modelOverrides = null, runtimeResolver = null) {
   const sandboxMode = CODEX_AGENT_SANDBOX[agentName] || 'read-only';
   const { frontmatter, body } = extractFrontmatterAndBody(agentContent);
   const frontmatterText = frontmatter || '';
@@ -1808,9 +1931,20 @@ function generateCodexAgentToml(agentName, agentContent, modelOverrides = null) 
   // Embed model override when configured in ~/.gsd/defaults.json so that
   // model_overrides is respected on Codex (which uses static TOML, not inline
   // Task() model parameters). See #2256.
+  // Precedence: per-agent model_overrides > runtime-aware tier resolution (#2517).
   const modelOverride = modelOverrides?.[resolvedName] || modelOverrides?.[agentName];
   if (modelOverride) {
     lines.push(`model = ${JSON.stringify(modelOverride)}`);
+  } else if (runtimeResolver) {
+    // #2517 — runtime-aware tier resolution. Embeds Codex-native model + reasoning_effort
+    // from RUNTIME_PROFILE_MAP / model_profile_overrides for the configured tier.
+    const entry = runtimeResolver.resolve(resolvedName) || runtimeResolver.resolve(agentName);
+    if (entry?.model) {
+      lines.push(`model = ${JSON.stringify(entry.model)}`);
+      if (entry.reasoning_effort) {
+        lines.push(`model_reasoning_effort = ${JSON.stringify(entry.reasoning_effort)}`);
+      }
+    }
   }
 
   // Agent prompts contain raw backslashes in regexes and shell snippets.
@@ -3050,8 +3184,16 @@ function installCodexConfig(targetDir, agentsSrc) {
 
     // Pass model overrides from ~/.gsd/defaults.json so Codex TOML files
     // embed the configured model — Codex cannot receive model inline (#2256).
+    // #2517 — also pass the runtime-aware tier resolver so profile tiers can
+    // resolve to Codex-native model IDs + reasoning_effort when `runtime: "codex"`
+    // is set in defaults.json.
     const modelOverrides = readGsdGlobalModelOverrides();
-    const tomlContent = generateCodexAgentToml(name, content, modelOverrides);
+    // Pass `targetDir` so per-project .planning/config.json wins over global
+    // ~/.gsd/defaults.json — without this, the PR's headline claim that
+    // setting runtime in the project config reaches the Codex emit path is
+    // false (review finding #1).
+    const runtimeResolver = readGsdRuntimeProfileResolver(targetDir);
+    const tomlContent = generateCodexAgentToml(name, content, modelOverrides, runtimeResolver);
     fs.writeFileSync(path.join(agentsTomlDir, `${name}.toml`), tomlContent);
   }
 
@@ -6786,22 +6928,54 @@ function installSdkIfNeeded() {
   console.log(`\n  ${cyan}Building GSD SDK from source (${sdkDir})…${reset}`);
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
+  // Windows: Node.js refuses to spawn .cmd/.bat files without `shell: true`
+  // after CVE-2024-27980 (fixed in Node ≥ 18.20.2 / ≥ 20.12.2 / ≥ 21.7.3).
+  // Without shell, spawnSync returns { status: null, error: EINVAL } and
+  // every `status !== 0` check trips — producing a silent build failure
+  // with no underlying diagnostic because stdio: 'inherit' never gets a
+  // child to stream (#2598).
+  const needsShell = process.platform === 'win32';
+  const spawnNpm = (args, opts = {}) =>
+    spawnSync(npmCmd, args, { ...opts, shell: opts.shell ?? needsShell });
+
+  // Format the underlying spawnSync failure so EINVAL / ENOENT / signal exits
+  // surface in the fatal banner instead of being swallowed. The #2598 silent
+  // failure happened precisely because `{ status: null, error: EINVAL }` was
+  // reduced to a generic "Failed to npm install" with no diagnostic — the real
+  // cause (CVE-2024-27980 on Windows) was invisible in the output.
+  const formatSpawnFailure = (result) => {
+    if (!result) return '';
+    if (result.error) return ` (${result.error.code || result.error.name || 'spawn error'}: ${result.error.message})`;
+    if (result.signal) return ` (signal: ${result.signal})`;
+    if (typeof result.status === 'number') return ` (exit status: ${result.status})`;
+    return '';
+  };
+
   // 1. Install sdk build-time dependencies (tsc, etc.)
-  const installResult = spawnSync(npmCmd, ['install'], { cwd: sdkDir, stdio: 'inherit' });
+  const installResult = spawnNpm(['install'], { cwd: sdkDir, stdio: 'inherit' });
   if (installResult.status !== 0) {
-    emitSdkFatal('Failed to `npm install` in sdk/.', { globalBin: null, exitCode: 1 });
+    emitSdkFatal(
+      `Failed to \`npm install\` in sdk/.${formatSpawnFailure(installResult)}`,
+      { globalBin: null, exitCode: 1 },
+    );
   }
 
   // 2. Compile TypeScript → sdk/dist/
-  const buildResult = spawnSync(npmCmd, ['run', 'build'], { cwd: sdkDir, stdio: 'inherit' });
+  const buildResult = spawnNpm(['run', 'build'], { cwd: sdkDir, stdio: 'inherit' });
   if (buildResult.status !== 0) {
-    emitSdkFatal('Failed to `npm run build` in sdk/.', { globalBin: null, exitCode: 1 });
+    emitSdkFatal(
+      `Failed to \`npm run build\` in sdk/.${formatSpawnFailure(buildResult)}`,
+      { globalBin: null, exitCode: 1 },
+    );
   }
 
   // 3. Install the built package globally so `gsd-sdk` lands on PATH.
-  const globalResult = spawnSync(npmCmd, ['install', '-g', '.'], { cwd: sdkDir, stdio: 'inherit' });
+  const globalResult = spawnNpm(['install', '-g', '.'], { cwd: sdkDir, stdio: 'inherit' });
   if (globalResult.status !== 0) {
-    emitSdkFatal('Failed to `npm install -g .` from sdk/.', { globalBin: null, exitCode: 1 });
+    emitSdkFatal(
+      `Failed to \`npm install -g .\` from sdk/.${formatSpawnFailure(globalResult)}`,
+      { globalBin: null, exitCode: 1 },
+    );
   }
 
   // 3a. Explicitly chmod dist/cli.js to 0o755 in the global install location.
@@ -6811,7 +6985,7 @@ function installSdkIfNeeded() {
   // a non-executable file and `command -v gsd-sdk` fails on every first install
   // (root cause of #2453). Mirrors the pattern used for hook files in this installer.
   try {
-    const prefixRes = spawnSync(npmCmd, ['config', 'get', 'prefix'], { encoding: 'utf-8' });
+    const prefixRes = spawnNpm(['config', 'get', 'prefix'], { encoding: 'utf-8' });
     if (prefixRes.status === 0) {
       const npmPrefix = (prefixRes.stdout || '').trim();
       const sdkPkg = JSON.parse(fs.readFileSync(path.join(sdkDir, 'package.json'), 'utf-8'));
@@ -6835,7 +7009,7 @@ function installSdkIfNeeded() {
   }
 
   // Off-PATH: resolve npm global bin dir for actionable remediation.
-  const prefixResult = spawnSync(npmCmd, ['config', 'get', 'prefix'], { encoding: 'utf-8' });
+  const prefixResult = spawnNpm(['config', 'get', 'prefix'], { encoding: 'utf-8' });
   const prefix = prefixResult.status === 0 ? (prefixResult.stdout || '').trim() : null;
   const globalBin = prefix
     ? (process.platform === 'win32' ? prefix : path.join(prefix, 'bin'))
@@ -6911,6 +7085,7 @@ if (process.env.GSD_TEST_MODE) {
     stripGsdFromCodexConfig,
     mergeCodexConfig,
     installCodexConfig,
+    readGsdRuntimeProfileResolver,
     install,
     uninstall,
     convertClaudeCommandToCodexSkill,

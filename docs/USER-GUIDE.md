@@ -585,6 +585,20 @@ claude --dangerously-skip-permissions
 # (normal phase workflow from here)
 ```
 
+**Post-execute drift detection (#2003).** After every `/gsd:execute-phase`,
+GSD checks whether the phase introduced enough structural change
+(new directories, barrel exports, migrations, or route modules) to make
+`.planning/codebase/STRUCTURE.md` stale. If it did, the default behavior is
+to print a one-shot warning suggesting the exact `/gsd:map-codebase --paths …`
+invocation to refresh just the affected subtrees. Flip the behavior with:
+
+```bash
+/gsd:settings workflow.drift_action auto-remap       # remap automatically
+/gsd:settings workflow.drift_threshold 5             # tune sensitivity
+```
+
+The gate is non-blocking: any internal failure logs and the phase continues.
+
 ### Quick Bug Fix
 
 ```bash
@@ -739,6 +753,19 @@ To assign different models to different agents on a non-Claude runtime, add `mod
 ```
 
 The installer auto-configures `resolve_model_ids: "omit"` for Gemini CLI, OpenCode, Kilo, and Codex. If you're manually setting up a non-Claude runtime, add it to `.planning/config.json` yourself.
+
+#### Switching from Claude to Codex with one config change (#2517)
+
+If you want tiered models on Codex without writing a large `model_overrides` block, set `runtime: "codex"` and pick a profile:
+
+```json
+{
+  "runtime": "codex",
+  "model_profile": "balanced"
+}
+```
+
+GSD will resolve each agent's tier (`opus`/`sonnet`/`haiku`) to the Codex-native model and reasoning effort defined in the runtime tier map (`gpt-5.4` xhigh / `gpt-5.3-codex` medium / `gpt-5.4-mini` medium). The Codex installer embeds both `model` and `model_reasoning_effort` into each agent's TOML automatically. To override a single tier, add `model_profile_overrides.codex.<tier>`. See [Runtime-Aware Profiles](CONFIGURATION.md#runtime-aware-profiles-2517).
 
 See the [Configuration Reference](CONFIGURATION.md#non-claude-runtimes-codex-opencode-gemini-cli-kilo) for the full explanation.
 
