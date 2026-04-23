@@ -635,6 +635,63 @@ function readGsdGlobalModelOverrides() {
 }
 
 /**
+ * Effective per-agent model_overrides for the Codex / OpenCode install paths.
+ *
+ * Merges `~/.gsd/defaults.json` (global) with per-project
+ * `<project>/.planning/config.json`. Per-project keys win on conflict so a
+ * user can tune a single agent's model in one repo without re-setting the
+ * global defaults for every other repo. Non-conflicting keys from both
+ * sources are preserved.
+ *
+ * This is the fix for #2256: both adapters previously read only the global
+ * file, so a per-project `model_overrides` (the common case the reporter
+ * described — a per-project override for `gsd-codebase-mapper` in
+ * `.planning/config.json`) was silently dropped and child agents inherited
+ * the session default.
+ *
+ * `targetDir` is the consuming runtime's install root (e.g. `~/.codex` for
+ * a global install, or `<project>/.codex` for a local install). We walk up
+ * from there looking for `.planning/` so both cases resolve the correct
+ * project root. When `targetDir` is null/undefined only the global file is
+ * consulted (matches prior behavior for code paths that have no project
+ * context).
+ *
+ * Returns a plain `{ agentName: modelId }` object, or `null` when neither
+ * source defines `model_overrides`.
+ */
+function readGsdEffectiveModelOverrides(targetDir = null) {
+  const global = readGsdGlobalModelOverrides();
+
+  let projectOverrides = null;
+  if (targetDir) {
+    let probeDir = path.resolve(targetDir);
+    for (let depth = 0; depth < 8; depth += 1) {
+      const candidate = path.join(probeDir, '.planning', 'config.json');
+      if (fs.existsSync(candidate)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(candidate, 'utf-8'));
+          if (parsed && typeof parsed === 'object' && parsed.model_overrides
+              && typeof parsed.model_overrides === 'object') {
+            projectOverrides = parsed.model_overrides;
+          }
+        } catch {
+          // Malformed config.json — fall back to global; readGsdRuntimeProfileResolver
+          // surfaces a parse warning via _readGsdConfigFile already.
+        }
+        break;
+      }
+      const parent = path.dirname(probeDir);
+      if (parent === probeDir) break;
+      probeDir = parent;
+    }
+  }
+
+  if (!global && !projectOverrides) return null;
+  // Per-project wins on conflict; preserve non-conflicting global keys.
+  return { ...(global || {}), ...(projectOverrides || {}) };
+}
+
+/**
  * #2517 — Read a single GSD config file (defaults.json or per-project
  * config.json) into a plain object, returning null on missing/empty files
  * and warning to stderr on JSON parse failures so silent corruption can't
@@ -1852,8 +1909,16 @@ GSD workflows use \`Task(...)\` (Claude Code syntax). Translate to Codex collabo
 
 Direct mapping:
 - \`Task(subagent_type="X", prompt="Y")\` → \`spawn_agent(agent_type="X", message="Y")\`
-- \`Task(model="...")\` → omit (Codex uses per-role config, not inline model selection)
+- \`Task(model="...")\` → omit. \`spawn_agent\` has no inline \`model\` parameter;
+  GSD embeds the resolved per-agent model directly into each agent's \`.toml\`
+  at install time so \`model_overrides\` from \`.planning/config.json\` and
+  \`~/.gsd/defaults.json\` are honored automatically by Codex's agent router.
 - \`fork_context: false\` by default — GSD agents load their own context via \`<files_to_read>\` blocks
+
+Spawn restriction:
+- Codex restricts \`spawn_agent\` to cases where the user has explicitly
+  requested sub-agents. When automatic spawning is not permitted, do the
+  work inline in the current agent rather than attempting to force a spawn.
 
 Parallel fan-out:
 - Spawn multiple agents → collect agent IDs → \`wait(ids)\` for all to complete
@@ -3182,12 +3247,15 @@ function installCodexConfig(targetDir, agentsSrc) {
 
     agents.push({ name, description: toSingleLine(description) });
 
-    // Pass model overrides from ~/.gsd/defaults.json so Codex TOML files
+    // Pass model overrides from both per-project `.planning/config.json` and
+    // `~/.gsd/defaults.json` (project wins on conflict) so Codex TOML files
     // embed the configured model — Codex cannot receive model inline (#2256).
+    // Previously only the global file was read, which silently dropped the
+    // per-project override the reporter had set for gsd-codebase-mapper.
     // #2517 — also pass the runtime-aware tier resolver so profile tiers can
     // resolve to Codex-native model IDs + reasoning_effort when `runtime: "codex"`
     // is set in defaults.json.
-    const modelOverrides = readGsdGlobalModelOverrides();
+    const modelOverrides = readGsdEffectiveModelOverrides(targetDir);
     // Pass `targetDir` so per-project .planning/config.json wins over global
     // ~/.gsd/defaults.json — without this, the PR's headline claim that
     // setting runtime in the project config reaches the Codex emit path is
@@ -5893,9 +5961,13 @@ function install(isGlobal, runtime = 'claude') {
         content = processAttribution(content, getCommitAttribution(runtime));
         // Convert frontmatter for runtime compatibility (agents need different handling)
         if (isOpencode) {
-          // Resolve per-agent model override from ~/.gsd/defaults.json (#2256)
+          // Resolve per-agent model override from BOTH per-project
+          // `.planning/config.json` and `~/.gsd/defaults.json`, with
+          // per-project winning on conflict (#2256). Without the per-project
+          // probe, an override set in `.planning/config.json` was silently
+          // ignored and the child inherited OpenCode's default model.
           const _ocAgentName = entry.name.replace(/\.md$/, '');
-          const _ocModelOverrides = readGsdGlobalModelOverrides();
+          const _ocModelOverrides = readGsdEffectiveModelOverrides(targetDir);
           const _ocModelOverride = _ocModelOverrides?.[_ocAgentName] || null;
           content = convertClaudeToOpencodeFrontmatter(content, { isAgent: true, modelOverride: _ocModelOverride });
         } else if (isKilo) {
@@ -6798,6 +6870,144 @@ function promptLocation(runtimes) {
 }
 
 /**
+ * Check whether any common shell rc file already contains a `PATH=` line
+ * whose HOME-expanded value places `globalBin` on PATH (#2620).
+ *
+ * Parses `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, `~/.profile` (or the
+ * override list in `rcFileNames`), matches `export PATH=` / bare `PATH=`
+ * lines, and substitutes the common HOME forms (`$HOME`, `${HOME}`, `~`)
+ * with `homeDir` before comparing each PATH segment against `globalBin`.
+ *
+ * Best-effort: any unreadable / malformed / non-existent rc file is ignored
+ * and the fallback is the caller's existing absolute-path suggestion. Only
+ * the `$HOME/…`, `${HOME}/…`, and `~/…` forms are handled — we do not try
+ * to fully parse bash syntax.
+ *
+ * @param {string} globalBin  Absolute path to npm's global bin directory.
+ * @param {string} homeDir    Absolute path used to substitute HOME / ~.
+ * @param {string[]} [rcFileNames]  Override the default rc file list.
+ * @returns {boolean}         true iff any rc file adds globalBin to PATH.
+ */
+function homePathCoveredByRc(globalBin, homeDir, rcFileNames) {
+  if (!globalBin || !homeDir) return false;
+  const path = require('path');
+  const fs = require('fs');
+
+  const normalise = (p) => {
+    if (!p) return '';
+    let n = p.replace(/[\\/]+$/g, '');
+    if (n === '') n = p.startsWith('/') ? '/' : p;
+    return n;
+  };
+
+  const targetAbs = normalise(path.resolve(globalBin));
+  const homeAbs = path.resolve(homeDir);
+  const files = rcFileNames || ['.zshrc', '.bashrc', '.bash_profile', '.profile'];
+
+  const expandHome = (segment) => {
+    let s = segment;
+    s = s.replace(/\$\{HOME\}/g, homeAbs);
+    s = s.replace(/\$HOME/g, homeAbs);
+    if (s.startsWith('~/') || s === '~') {
+      s = s === '~' ? homeAbs : path.join(homeAbs, s.slice(2));
+    }
+    return s;
+  };
+
+  // Match `PATH=…` (optionally prefixed with `export `). The RHS captures
+  // through end-of-line; surrounding quotes are stripped before splitting.
+  const assignRe = /^\s*(?:export\s+)?PATH\s*=\s*(.+?)\s*$/;
+
+  for (const name of files) {
+    const rcPath = path.join(homeAbs, name);
+    let content;
+    try {
+      content = fs.readFileSync(rcPath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.replace(/^\s+/, '');
+      if (line.startsWith('#')) continue;
+
+      const m = assignRe.exec(rawLine);
+      if (!m) continue;
+
+      let rhs = m[1];
+      if ((rhs.startsWith('"') && rhs.endsWith('"')) ||
+          (rhs.startsWith("'") && rhs.endsWith("'"))) {
+        rhs = rhs.slice(1, -1);
+      }
+
+      for (const segment of rhs.split(':')) {
+        if (!segment) continue;
+        const trimmed = segment.trim();
+        const expanded = expandHome(trimmed);
+        if (expanded.includes('$')) continue;
+        // Skip segments that are still relative after HOME expansion. A bare
+        // `bin` entry (or `./bin`, `node_modules/.bin`, etc.) depends on the
+        // shell's cwd at lookup time — it is NOT equivalent to `$HOME/bin`,
+        // so resolving against homeAbs would produce false positives.
+        if (!path.isAbsolute(expanded)) continue;
+        try {
+          const abs = normalise(path.resolve(expanded));
+          if (abs === targetAbs) return true;
+        } catch {
+          // ignore unresolvable segments
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Emit a PATH-export suggestion if globalBin is not already on PATH AND
+ * the user's shell rc files do not already cover it via a HOME-relative
+ * entry (#2620).
+ *
+ * Prints one of:
+ *   - nothing, if `globalBin` is already present on `process.env.PATH`
+ *   - a diagnostic "already covered via rc file" note, if an rc file has
+ *     `export PATH="$HOME/…/bin:$PATH"` (or equivalent) and the user just
+ *     needs to reopen their shell
+ *   - the absolute `echo 'export PATH="…:$PATH"' >> ~/.zshrc` suggestion,
+ *     if neither PATH nor any rc file covers globalBin
+ *
+ * Exported for tests; the installer calls this from finishInstall.
+ *
+ * @param {string} globalBin  Absolute path to npm's global bin directory.
+ * @param {string} homeDir    Absolute HOME path.
+ */
+function maybeSuggestPathExport(globalBin, homeDir) {
+  if (!globalBin || !homeDir) return;
+  const path = require('path');
+
+  const pathEnv = process.env.PATH || '';
+  const targetAbs = path.resolve(globalBin).replace(/[\\/]+$/g, '') || globalBin;
+  const onPath = pathEnv.split(path.delimiter).some((seg) => {
+    if (!seg) return false;
+    const abs = path.resolve(seg).replace(/[\\/]+$/g, '') || seg;
+    return abs === targetAbs;
+  });
+  if (onPath) return;
+
+  if (homePathCoveredByRc(globalBin, homeDir)) {
+    console.log(`  ${yellow}⚠${reset} ${bold}gsd-sdk${reset}'s directory is already on your PATH via an rc file entry — try reopening your shell (or ${cyan}source ~/.zshrc${reset}).`);
+    return;
+  }
+
+  console.log('');
+  console.log(`  ${yellow}⚠${reset} ${bold}${globalBin}${reset} is not on your PATH.`);
+  console.log(`    Add it with one of:`);
+  console.log(`      ${cyan}echo 'export PATH="${globalBin}:$PATH"' >> ~/.zshrc${reset}`);
+  console.log(`      ${cyan}echo 'export PATH="${globalBin}:$PATH"' >> ~/.bashrc${reset}`);
+  console.log('');
+}
+
+/**
  * Verify the prebuilt SDK dist is present and the gsd-sdk shim is wired up.
  *
  * As of fix/2441-sdk-decouple, sdk/dist/ is shipped prebuilt inside the
@@ -6855,6 +7065,21 @@ function installSdkIfNeeded() {
   }
 
   console.log(`  ${green}✓${reset} GSD SDK ready (sdk/dist/cli.js)`);
+
+  // #2620: warn if npm's global bin is not on PATH, suppressing the
+  // absolute-path suggestion when the user's rc already covers it via
+  // a HOME-relative entry (e.g. `export PATH="$HOME/.npm-global/bin:$PATH"`).
+  try {
+    const { execSync } = require('child_process');
+    const npmPrefix = execSync('npm prefix -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (npmPrefix) {
+      // On Windows npm prefix IS the bin dir; on POSIX it's `${prefix}/bin`.
+      const globalBin = process.platform === 'win32' ? npmPrefix : path.join(npmPrefix, 'bin');
+      maybeSuggestPathExport(globalBin, os.homedir());
+    }
+  } catch {
+    // npm not available / exec failed — silently skip the PATH advice.
+  }
 }
 
 /**
@@ -6918,6 +7143,7 @@ if (process.env.GSD_TEST_MODE) {
     mergeCodexConfig,
     installCodexConfig,
     readGsdRuntimeProfileResolver,
+    readGsdEffectiveModelOverrides,
     install,
     uninstall,
     convertClaudeCommandToCodexSkill,
@@ -6972,6 +7198,8 @@ if (process.env.GSD_TEST_MODE) {
     preserveUserArtifacts,
     restoreUserArtifacts,
     finishInstall,
+    homePathCoveredByRc,
+    maybeSuggestPathExport,
   };
 } else {
 
