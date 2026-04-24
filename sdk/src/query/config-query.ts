@@ -42,7 +42,6 @@ export const MODEL_PROFILES: Record<string, Record<string, string>> = {
   'gsd-plan-checker': { quality: 'sonnet', balanced: 'sonnet', budget: 'haiku', adaptive: 'haiku' },
   'gsd-integration-checker': { quality: 'sonnet', balanced: 'sonnet', budget: 'haiku', adaptive: 'haiku' },
   'gsd-nyquist-auditor': { quality: 'sonnet', balanced: 'sonnet', budget: 'haiku', adaptive: 'haiku' },
-  'gsd-pattern-mapper': { quality: 'sonnet', balanced: 'sonnet', budget: 'haiku', adaptive: 'haiku' },
   'gsd-ui-researcher': { quality: 'opus', balanced: 'sonnet', budget: 'haiku', adaptive: 'sonnet' },
   'gsd-ui-checker': { quality: 'sonnet', balanced: 'sonnet', budget: 'haiku', adaptive: 'haiku' },
   'gsd-ui-auditor': { quality: 'sonnet', balanced: 'sonnet', budget: 'haiku', adaptive: 'haiku' },
@@ -52,19 +51,6 @@ export const MODEL_PROFILES: Record<string, Record<string, string>> = {
 
 /** Valid model profile names. */
 export const VALID_PROFILES: string[] = Object.keys(MODEL_PROFILES['gsd-planner']);
-
-/**
- * Flat map of agent name → model alias for one profile tier (matches `model-profiles.cjs`).
- */
-export function getAgentToModelMapForProfile(normalizedProfile: string): Record<string, string> {
-  const profile = VALID_PROFILES.includes(normalizedProfile) ? normalizedProfile : 'balanced';
-  const agentToModelMap: Record<string, string> = {};
-  for (const [agent, profileToModelMap] of Object.entries(MODEL_PROFILES)) {
-    const mapped = profileToModelMap[profile] ?? profileToModelMap.balanced;
-    agentToModelMap[agent] = mapped ?? 'sonnet';
-  }
-  return agentToModelMap;
-}
 
 // ─── configGet ──────────────────────────────────────────────────────────────
 
@@ -79,7 +65,7 @@ export function getAgentToModelMapForProfile(normalizedProfile: string): Record<
  * @returns QueryResult with the config value at the given path
  * @throws GSDError with Validation classification if key missing or not found
  */
-export const configGet: QueryHandler = async (args, projectDir, _workstream) => {
+export const configGet: QueryHandler = async (args, projectDir) => {
   const keyPath = args[0];
   if (!keyPath) {
     throw new GSDError('Usage: config-get <key.path>', ErrorClassification.Validation);
@@ -104,34 +90,15 @@ export const configGet: QueryHandler = async (args, projectDir, _workstream) => 
   let current: unknown = config;
   for (const key of keys) {
     if (current === undefined || current === null || typeof current !== 'object') {
-      // UNIX convention (cf. `git config --get`): missing key exits 1, not 10.
-      // See issue #2544 — callers use `if ! gsd-sdk query config-get k; then` patterns.
-      throw new GSDError(`Key not found: ${keyPath}`, ErrorClassification.Execution);
+      throw new GSDError(`Key not found: ${keyPath}`, ErrorClassification.Validation);
     }
     current = (current as Record<string, unknown>)[key];
   }
   if (current === undefined) {
-    throw new GSDError(`Key not found: ${keyPath}`, ErrorClassification.Execution);
+    throw new GSDError(`Key not found: ${keyPath}`, ErrorClassification.Validation);
   }
 
   return { data: current };
-};
-
-// ─── configPath ─────────────────────────────────────────────────────────────
-
-/**
- * Query handler for config-path — resolved `.planning/config.json` path (workstream-aware via cwd).
- *
- * Port of `cmdConfigPath` from `config.cjs`. The JSON query API returns `{ path }`; the CJS CLI
- * emits the path as plain text for shell substitution.
- *
- * @param _args - Unused
- * @param projectDir - Project root directory
- * @returns QueryResult with `{ path: string }` absolute or project-relative resolution via planningPaths
- */
-export const configPath: QueryHandler = async (_args, projectDir, _workstream) => {
-  const paths = planningPaths(projectDir);
-  return { data: { path: paths.config } };
 };
 
 // ─── resolveModel ───────────────────────────────────────────────────────────

@@ -34,13 +34,6 @@ describe('isValidConfigKey', () => {
     expect(isValidConfigKey('workflow.auto_advance').valid).toBe(true);
   });
 
-  it('accepts workflow.context_coverage_gate (#2492)', async () => {
-    const { isValidConfigKey, parseConfigValue } = await import('./config-mutation.js');
-    expect(isValidConfigKey('workflow.context_coverage_gate').valid).toBe(true);
-    expect(parseConfigValue('true')).toBe(true);
-    expect(parseConfigValue('false')).toBe(false);
-  });
-
   it('accepts wildcard agent_skills.* patterns', async () => {
     const { isValidConfigKey } = await import('./config-mutation.js');
     expect(isValidConfigKey('agent_skills.gsd-planner').valid).toBe(true);
@@ -165,8 +158,8 @@ describe('configSet lock protection (D6)', () => {
       configSet(['commit_docs', 'true'], tmpDir),
       configSet(['model_profile', 'quality'], tmpDir),
     ]);
-    expect((r1.data as { updated: boolean }).updated).toBe(true);
-    expect((r2.data as { updated: boolean }).updated).toBe(true);
+    expect((r1.data as { set: boolean }).set).toBe(true);
+    expect((r2.data as { set: boolean }).set).toBe(true);
 
     // Both values should be present (no lost updates)
     const raw = JSON.parse(await readFile(join(tmpDir, '.planning', 'config.json'), 'utf-8'));
@@ -191,7 +184,7 @@ describe('configSet context validation (D8)', () => {
     for (const ctx of ['dev', 'research', 'review']) {
       await writeFile(join(tmpDir, '.planning', 'config.json'), '{}');
       const result = await configSet(['context', ctx], tmpDir);
-      expect((result.data as { updated: boolean }).updated).toBe(true);
+      expect((result.data as { set: boolean }).set).toBe(true);
     }
   });
 });
@@ -219,12 +212,7 @@ describe('configSet', () => {
       JSON.stringify({ model_profile: 'balanced' }),
     );
     const result = await configSet(['model_profile', 'quality'], tmpDir);
-    expect(result.data).toEqual({
-      updated: true,
-      key: 'model_profile',
-      value: 'quality',
-      previousValue: 'balanced',
-    });
+    expect(result.data).toEqual({ set: true, key: 'model_profile', value: 'quality' });
 
     const raw = JSON.parse(await readFile(join(tmpDir, '.planning', 'config.json'), 'utf-8'));
     expect(raw.model_profile).toBe('quality');
@@ -237,11 +225,7 @@ describe('configSet', () => {
       JSON.stringify({ workflow: { research: true } }),
     );
     const result = await configSet(['workflow.auto_advance', 'true'], tmpDir);
-    expect(result.data).toEqual({
-      updated: true,
-      key: 'workflow.auto_advance',
-      value: true,
-    });
+    expect(result.data).toEqual({ set: true, key: 'workflow.auto_advance', value: true });
 
     const raw = JSON.parse(await readFile(join(tmpDir, '.planning', 'config.json'), 'utf-8'));
     expect(raw.workflow.auto_advance).toBe(true);
@@ -279,7 +263,7 @@ describe('configSetModelProfile', () => {
       JSON.stringify({ model_profile: 'balanced' }),
     );
     const result = await configSetModelProfile(['quality'], tmpDir);
-    expect((result.data as { updated: boolean }).updated).toBe(true);
+    expect((result.data as { set: boolean }).set).toBe(true);
     expect((result.data as { profile: string }).profile).toBe('quality');
 
     const raw = JSON.parse(await readFile(join(tmpDir, '.planning', 'config.json'), 'utf-8'));
@@ -316,7 +300,7 @@ describe('configNewProject', () => {
 
     const raw = JSON.parse(await readFile(join(tmpDir, '.planning', 'config.json'), 'utf-8'));
     expect(raw.model_profile).toBe('balanced');
-    expect(raw.commit_docs).toBe(true);
+    expect(raw.commit_docs).toBe(false);
   });
 
   it('merges user choices', async () => {

@@ -30,11 +30,11 @@
   "author": "TÂCHES",
   "license": "MIT",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "rm -rf dist && tsc && chmod +x dist/cli.js",
+    "prepublishOnly": "npm run build",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration"

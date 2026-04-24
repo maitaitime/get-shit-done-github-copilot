@@ -68,7 +68,7 @@ describe('Thinking Partner Integration (#1726)', () => {
   describe('Config integration', () => {
     test('features.thinking_partner is in VALID_CONFIG_KEYS', () => {
       const configSrc = fs.readFileSync(
-        path.join(GSD_ROOT, 'bin', 'lib', 'config-schema.cjs'),
+        path.join(GSD_ROOT, 'bin', 'lib', 'config.cjs'),
         'utf-8'
       );
       assert.ok(
@@ -91,51 +91,48 @@ describe('Thinking Partner Integration (#1726)', () => {
   });
 
   // Workflow integration tests
-  // After #2551 progressive-disclosure refactor, the thinking-partner block
-  // moved into the per-mode files (default.md, advisor.md) since the prompt
-  // is mode-specific (only fires inside discuss_areas, after a user answer).
   describe('Discuss-phase integration', () => {
-    function readDiscussFamily() {
-      const candidates = [
-        path.join(GSD_ROOT, 'workflows', 'discuss-phase.md'),
-        path.join(GSD_ROOT, 'workflows', 'discuss-phase', 'modes', 'default.md'),
-        path.join(GSD_ROOT, 'workflows', 'discuss-phase', 'modes', 'advisor.md'),
-      ];
-      return candidates
-        .filter(p => fs.existsSync(p))
-        .map(p => fs.readFileSync(p, 'utf-8'))
-        .join('\n');
-    }
-
     test('discuss-phase.md contains thinking partner conditional block', () => {
-      const content = readDiscussFamily();
+      const content = fs.readFileSync(
+        path.join(GSD_ROOT, 'workflows', 'discuss-phase.md'),
+        'utf-8'
+      );
       assert.ok(
         content.includes('Thinking partner (conditional)'),
-        'discuss-phase workflow family should contain thinking partner conditional block'
+        'discuss-phase.md should contain thinking partner conditional block'
       );
     });
 
     test('discuss-phase references features.thinking_partner config', () => {
-      const content = readDiscussFamily();
+      const content = fs.readFileSync(
+        path.join(GSD_ROOT, 'workflows', 'discuss-phase.md'),
+        'utf-8'
+      );
       assert.ok(
         content.includes('features.thinking_partner'),
-        'discuss-phase workflow family should reference the config key'
+        'discuss-phase.md should reference the config key'
       );
     });
 
     test('discuss-phase references thinking-partner.md for signal list', () => {
-      const content = readDiscussFamily();
+      const content = fs.readFileSync(
+        path.join(GSD_ROOT, 'workflows', 'discuss-phase.md'),
+        'utf-8'
+      );
       assert.ok(
         content.includes('references/thinking-partner.md'),
-        'discuss-phase workflow family should reference the signal list doc'
+        'discuss-phase.md should reference the signal list doc'
       );
     });
 
     test('discuss-phase offers skip option', () => {
-      const content = readDiscussFamily();
+      const content = fs.readFileSync(
+        path.join(GSD_ROOT, 'workflows', 'discuss-phase.md'),
+        'utf-8'
+      );
       assert.ok(
         content.includes('No, decision made'),
-        'discuss-phase workflow family should offer a skip/decline option'
+        'discuss-phase.md should offer a skip/decline option'
       );
     });
   });

@@ -10,7 +10,7 @@
  * import { configSet, configNewProject } from './config-mutation.js';
  *
  * await configSet(['model_profile', 'quality'], '/project');
- * // { data: { updated: true, key: 'model_profile', value: 'quality', previousValue: 'balanced' } }
+ * // { data: { set: true, key: 'model_profile', value: 'quality' } }
  *
  * await configNewProject([], '/project');
  * // { data: { created: true, path: '.planning/config.json' } }
@@ -22,7 +22,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { GSDError, ErrorClassification } from '../errors.js';
-import { VALID_PROFILES, getAgentToModelMapForProfile } from './config-query.js';
+import { MODEL_PROFILES, VALID_PROFILES } from './config-query.js';
 import { planningPaths } from './helpers.js';
 import { acquireStateLock, releaseStateLock } from './state-mutation.js';
 import type { QueryHandler } from './utils.js';
@@ -63,8 +63,7 @@ const VALID_CONFIG_KEYS = new Set([
   'workflow.research_before_questions',
   'workflow.discuss_mode',
   'workflow.skip_discuss',
-  'workflow.ui_review',
-  'workflow.max_discuss_passes',
+  'workflow._auto_chain_active',
   'workflow.use_worktrees',
   'workflow.code_review',
   'workflow.code_review_depth',
@@ -72,9 +71,7 @@ const VALID_CONFIG_KEYS = new Set([
   'git.milestone_branch_template', 'git.quick_branch_template',
   'planning.commit_docs', 'planning.search_gitignored',
   'workflow.subagent_timeout',
-  'workflow.context_coverage_gate',
   'hooks.context_warnings',
-  'hooks.workflow_guard',
   'features.thinking_partner',
   'features.global_learnings',
   'learnings.max_inject',
@@ -180,18 +177,6 @@ export function parseConfigValue(value: string): unknown {
  * @param dotPath - Dot-notation key path (e.g., 'workflow.auto_advance')
  * @param value - Value to set
  */
-function getValueAtPath(obj: Record<string, unknown>, dotPath: string): unknown {
-  const keys = dotPath.split('.');
-  let current: unknown = obj;
-  for (const key of keys) {
-    if (current === undefined || current === null || typeof current !== 'object') {
-      return undefined;
-    }
-    current = (current as Record<string, unknown>)[key];
-  }
-  return current;
-}
-
 function setConfigValue(obj: Record<string, unknown>, dotPath: string, value: unknown): void {
   const keys = dotPath.split('.');
   let current: Record<string, unknown> = obj;
@@ -215,10 +200,10 @@ function setConfigValue(obj: Record<string, unknown>, dotPath: string, value: un
  *
  * @param args - args[0]=key, args[1]=value
  * @param projectDir - Project root directory
- * @returns QueryResult matching gsd-tools `config-set` JSON: `{ updated, key, value, previousValue }`
+ * @returns QueryResult with { set: true, key, value }
  * @throws GSDError with Validation if key is invalid or args missing
  */
-export const configSet: QueryHandler = async (args, projectDir, _workstream) => {
+export const configSet: QueryHandler = async (args, projectDir) => {
   const keyPath = args[0];
   const rawValue = args[1];
   if (!keyPath) {
@@ -248,7 +233,6 @@ export const configSet: QueryHandler = async (args, projectDir, _workstream) => 
   // D6: Lock protection for read-modify-write (match CJS config.cjs:296)
   const paths = planningPaths(projectDir);
   const lockPath = await acquireStateLock(paths.config);
-  let previousValue: unknown;
   try {
     let config: Record<string, unknown> = {};
     try {
@@ -258,23 +242,13 @@ export const configSet: QueryHandler = async (args, projectDir, _workstream) => 
       // Start with empty config if file doesn't exist or is malformed
     }
 
-    previousValue = getValueAtPath(config, keyPath);
     setConfigValue(config, keyPath, parsedValue);
     await atomicWriteConfig(paths.config, config);
   } finally {
     await releaseStateLock(lockPath);
   }
 
-  // Match CJS JSON: `JSON.stringify` omits keys whose value is `undefined`
-  const data: Record<string, unknown> = {
-    updated: true,
-    key: keyPath,
-    value: parsedValue,
-  };
-  if (previousValue !== undefined) {
-    data.previousValue = previousValue;
-  }
-  return { data };
+  return { data: { set: true, key: keyPath, value: parsedValue } };
 };
 
 // ─── configSetModelProfile ────────────────────────────────────────────────
@@ -287,7 +261,7 @@ export const configSet: QueryHandler = async (args, projectDir, _workstream) => 
  * @returns QueryResult with { set: true, profile, agents }
  * @throws GSDError with Validation if profile is invalid
  */
-export const configSetModelProfile: QueryHandler = async (args, projectDir, _workstream) => {
+export const configSetModelProfile: QueryHandler = async (args, projectDir) => {
   const profileName = args[0];
   if (!profileName) {
     throw new GSDError(
@@ -307,7 +281,6 @@ export const configSetModelProfile: QueryHandler = async (args, projectDir, _wor
   // D6: Lock protection for read-modify-write
   const paths = planningPaths(projectDir);
   const lockPath = await acquireStateLock(paths.config);
-  let previousProfile = 'balanced';
   try {
     let config: Record<string, unknown> = {};
     try {
@@ -317,24 +290,13 @@ export const configSetModelProfile: QueryHandler = async (args, projectDir, _wor
       // Start with empty config
     }
 
-    const prev =
-      typeof config.model_profile === 'string' ? config.model_profile.toLowerCase().trim() : '';
-    previousProfile = VALID_PROFILES.includes(prev) ? prev : 'balanced';
     config.model_profile = normalized;
     await atomicWriteConfig(paths.config, config);
   } finally {
     await releaseStateLock(lockPath);
   }
 
-  const agentToModelMap = getAgentToModelMapForProfile(normalized);
-  return {
-    data: {
-      updated: true,
-      profile: normalized,
-      previousProfile,
-      agentToModelMap,
-    },
-  };
+  return { data: { set: true, profile: normalized, agents: MODEL_PROFILES } };
 };
 
 // ─── configNewProject ─────────────────────────────────────────────────────
@@ -349,7 +311,7 @@ export const configSetModelProfile: QueryHandler = async (args, projectDir, _wor
  * @param projectDir - Project root directory
  * @returns QueryResult with { created: true, path } or { created: false, reason }
  */
-export const configNewProject: QueryHandler = async (args, projectDir, _workstream) => {
+export const configNewProject: QueryHandler = async (args, projectDir) => {
   const paths = planningPaths(projectDir);
 
   // Idempotent: don't overwrite existing config
@@ -475,7 +437,7 @@ export const configNewProject: QueryHandler = async (args, projectDir, _workstre
  * @param projectDir - Project root directory
  * @returns QueryResult with { ensured: true, section }
  */
-export const configEnsureSection: QueryHandler = async (args, projectDir, _workstream) => {
+export const configEnsureSection: QueryHandler = async (args, projectDir) => {
   const sectionName = args[0];
   if (!sectionName) {
     throw new GSDError('Usage: config-ensure-section <section>', ErrorClassification.Validation);
