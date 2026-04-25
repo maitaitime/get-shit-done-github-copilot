@@ -2,11 +2,11 @@
 name: gsd.insert-phase
 description: "Insert urgent work as decimal phase (e.g., 72.1) between existing phases"
 argument-hint: "<after> <description>"
-tools: ['edit', 'execute', 'read']
+tools: ['execute', 'read']
 agent: agent
 ---
 
-<!-- upstream-tools: ["Read","Write","Bash"] -->
+<!-- upstream-tools: ["Read","Bash"] -->
 
 <objective>
 Insert a decimal phase for urgent work discovered mid-milestone that must be completed between existing integer phases.
