@@ -2066,10 +2066,10 @@ function generateCodexConfigBlock(agents, targetDir) {
   ];
 
   for (const { name, description } of agents) {
-    // #2645 — Codex schema requires [[agents]] array-of-tables, not [agents.<name>] maps.
-    // Emitting [agents.<name>] produces `invalid type: map, expected a sequence` on load.
-    lines.push(`[[agents]]`);
-    lines.push(`name = ${JSON.stringify(name)}`);
+    // #2727 — Codex 0.124.0 requires [agents.<name>] struct format, not [[agents]] sequence.
+    // [[agents]] (introduced in #2645) is rejected by codex-cli 0.124.0 with
+    // "invalid type: sequence, expected struct AgentsToml in `agents`".
+    lines.push(`[agents.${name}]`);
     lines.push(`description = ${JSON.stringify(description)}`);
     lines.push(`config_file = "${agentsPrefix}/${name}.toml"`);
     lines.push('');
@@ -2081,9 +2081,9 @@ function generateCodexConfigBlock(agents, targetDir) {
 /**
  * Strip any managed GSD agent sections from a TOML string.
  *
- * Handles BOTH shapes so reinstall self-heals broken legacy configs:
- *   - Legacy: `[agents.gsd-*]` single-keyed map tables (pre-#2645).
- *   - Current: `[[agents]]` array-of-tables whose `name = "gsd-*"`.
+ * Handles BOTH shapes so reinstall self-heals configs from all GSD versions:
+ *   - Current (#2727): `[agents.gsd-*]` struct tables (Codex 0.120.0+).
+ *   - Legacy (#2645): `[[agents]]` array-of-tables whose `name = "gsd-*"`.
  *
  * A section runs from its header to the next `[` header or EOF.
  */
@@ -2091,12 +2091,12 @@ function stripCodexGsdAgentSections(content) {
   // Use the TOML-aware section parser so we never absorb adjacent user-authored
   // tables — even if their headers are indented or otherwise oddly placed.
   const sections = getTomlTableSections(content).filter((section) => {
-    // Legacy `[agents.gsd-<name>]` map tables (pre-#2645).
+    // Current `[agents.gsd-<name>]` struct tables (#2727, Codex 0.120.0+).
     if (!section.array && /^agents\.gsd-/.test(section.path)) {
       return true;
     }
 
-    // Current `[[agents]]` array-of-tables — only strip blocks whose
+    // Legacy `[[agents]]` array-of-tables (#2645) — only strip blocks whose
     // `name = "gsd-..."`, preserving user-authored [[agents]] entries.
     if (section.array && section.path === 'agents') {
       const body = content.slice(section.headerEnd, section.end);
