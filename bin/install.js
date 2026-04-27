@@ -4506,6 +4506,24 @@ function copyCommandsAsAntigravitySkills(srcDir, skillsDir, prefix, isGlobal = f
 }
 
 /**
+ * Single source of truth for user-owned artifacts inside get-shit-done/.
+ *
+ * These files are created/refreshed by user-facing workflows (e.g.
+ * /gsd-profile-user) and must be preserved across reinstalls. Critically, they
+ * MUST be excluded from gsd-file-manifest.json — otherwise saveLocalPatches()
+ * will compare a refreshed file against a stale manifest hash and emit a
+ * spurious "locally modified GSD file" warning (bug #2771).
+ *
+ * Invariant: a file is either distribution (manifest-tracked, diff'd against
+ * manifest) or user artifact (preserved across installs, never diff'd). Never
+ * both. Both preserveUserArtifacts call sites and writeManifest must agree on
+ * this list, which is why it lives here as a single constant.
+ *
+ * Paths are relative to the get-shit-done/ directory.
+ */
+const USER_OWNED_ARTIFACTS = ['USER-PROFILE.md'];
+
+/**
  * Save user-generated files from destDir to an in-memory map before a wipe.
  *
  * @param {string} destDir - Directory that is about to be wiped
@@ -5687,6 +5705,12 @@ function writeManifest(configDir, runtime = 'claude', options = {}) {
 
   const gsdHashes = generateManifest(gsdDir);
   for (const [rel, hash] of Object.entries(gsdHashes)) {
+    // Skip user-owned artifacts (e.g. USER-PROFILE.md). They are preserved
+    // across reinstalls by preserveUserArtifacts and must NOT be hashed into
+    // the manifest — otherwise saveLocalPatches() would flag every refresh
+    // as a "local patch" (bug #2771). Single source of truth:
+    // USER_OWNED_ARTIFACTS at top of file.
+    if (USER_OWNED_ARTIFACTS.includes(rel)) continue;
     manifest.files['get-shit-done/' + rel] = hash;
   }
   if (isGemini && fs.existsSync(commandsDir)) {
@@ -5755,6 +5779,14 @@ function saveLocalPatches(configDir) {
 
   let manifest;
   try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { return []; }
+
+  // Normalize legacy manifests written before #2771 fix: strip user-owned artifacts
+  // that were incorrectly recorded so refreshes don't surface false patches warnings.
+  if (manifest.files) {
+    for (const artifact of USER_OWNED_ARTIFACTS) {
+      delete manifest.files[`get-shit-done/${artifact}`];
+    }
+  }
 
   const patchesDir = path.join(configDir, PATCHES_DIR_NAME);
   const pristineDir = path.join(configDir, 'gsd-pristine');
@@ -6109,7 +6141,7 @@ function install(isGlobal, runtime = 'claude') {
   // Preserve user-generated files before the wipe-and-copy so they survive re-install
   const skillSrc = path.join(src, 'get-shit-done');
   const skillDest = path.join(targetDir, 'get-shit-done');
-  const savedGsdArtifacts = preserveUserArtifacts(skillDest, ['USER-PROFILE.md']);
+  const savedGsdArtifacts = preserveUserArtifacts(skillDest, USER_OWNED_ARTIFACTS);
   copyWithPathReplacement(skillSrc, skillDest, pathPrefix, runtime, false, isGlobal);
   restoreUserArtifacts(skillDest, savedGsdArtifacts);
   if (verifyInstalled(skillDest, 'get-shit-done')) {
@@ -7395,14 +7427,49 @@ function installSdkIfNeeded(opts) {
     // `node sdkCliPath` invocation in bin/gsd-sdk.js.
   }
 
-  console.log(`  ${green}✓${reset} GSD SDK ready (sdk/dist/cli.js)`);
+  // #2775: do not assert "GSD SDK ready" until `gsd-sdk` actually resolves on
+  // PATH. `npx get-shit-done-cc` only links the package's primary bin; the
+  // secondary `gsd-sdk` shim is left dangling under the npx cache and is NOT
+  // callable as a bare command. The previous file-presence-only check was a
+  // strictly weaker invariant than the one workflows depend on
+  // (`command -v gsd-sdk` resolving), and led to a false ✓ in npx-cache
+  // installs (issue #2775).
+  const shimSrc = path.resolve(__dirname, 'gsd-sdk.js');
+  let onPath = isGsdSdkOnPath();
+
+  if (!onPath) {
+    // Try to materialize the shim into a user-writable PATH location so the
+    // installer can deliver on the success message without requiring the user
+    // to run `npm install -g` separately. Picks the first PATH entry that
+    // looks like a user-owned bin dir; falls back to ~/.local/bin even if
+    // it's not on PATH (then a follow-up suggestion is printed).
+    const linked = trySelfLinkGsdSdk(shimSrc);
+    if (linked) {
+      onPath = isGsdSdkOnPath();
+      if (onPath) {
+        console.log(`  ${dim}↪ linked gsd-sdk → ${linked}${reset}`);
+      }
+    }
+  }
+
+  if (onPath) {
+    console.log(`  ${green}✓${reset} GSD SDK ready (sdk/dist/cli.js)`);
+  } else {
+    console.log('');
+    console.log(`  ${yellow}⚠${reset} GSD SDK files are present but ${bold}gsd-sdk${reset} is not on your PATH.`);
+    console.log(`    Workflows that call ${cyan}gsd-sdk query …${reset} will fail with "command not found".`);
+    console.log(`    Install globally to materialize the bin symlink:`);
+    console.log(`      ${cyan}npm install -g get-shit-done-cc${reset}`);
+    console.log(`    Or add a directory containing the shim to your PATH manually.`);
+    console.log('');
+  }
 
   // #2620: warn if npm's global bin is not on PATH, suppressing the
   // absolute-path suggestion when the user's rc already covers it via
   // a HOME-relative entry (e.g. `export PATH="$HOME/.npm-global/bin:$PATH"`).
   try {
-    const { execSync } = require('child_process');
-    const npmPrefix = execSync('npm prefix -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const cp = require('child_process');
+    const npmPrefix = cp.execSync('npm prefix -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     if (npmPrefix) {
       // On Windows npm prefix IS the bin dir; on POSIX it's `${prefix}/bin`.
       const globalBin = process.platform === 'win32' ? npmPrefix : path.join(npmPrefix, 'bin');
@@ -7411,6 +7478,105 @@ function installSdkIfNeeded(opts) {
   } catch {
     // npm not available / exec failed — silently skip the PATH advice.
   }
+}
+
+/**
+ * #2775 helper: check whether a callable `gsd-sdk` exists on the current PATH.
+ *
+ * Pure PATH walk (no spawn) — we look for a regular file or symlink named
+ * `gsd-sdk` (or `gsd-sdk.cmd`/`.exe` on Windows) in any directory on PATH and
+ * verify it carries the execute bit on POSIX. Avoids paying spawn cost and
+ * avoids the chicken-and-egg of needing to run the not-yet-installed binary.
+ */
+function isGsdSdkOnPath() {
+  const path = require('path');
+  const fs = require('fs');
+  const pathEnv = process.env.PATH || '';
+  const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
+  for (const seg of pathEnv.split(path.delimiter)) {
+    if (!seg) continue;
+    for (const ext of exts) {
+      const candidate = path.join(seg, `gsd-sdk${ext}`);
+      try {
+        const st = fs.statSync(candidate);
+        if (st.isFile()) {
+          if (process.platform === 'win32') return true;
+          if ((st.mode & 0o111) !== 0) return true;
+        }
+      } catch {
+        // missing / EACCES on dir — keep scanning.
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * #2775 helper: attempt to materialize the `gsd-sdk` shim at a user-writable
+ * PATH location. Returns the absolute path created on success, or null if no
+ * suitable location was usable.
+ *
+ * Strategy (POSIX): prefer ~/.local/bin (creating it if absent — many distros
+ * already have it on PATH via .profile). Fall back to the first PATH entry
+ * under HOME we can write to. Skip on Windows (npm install -g is the right
+ * primitive there; we don't try to fabricate a .cmd shim).
+ */
+function trySelfLinkGsdSdk(shimSrc) {
+  if (process.platform === 'win32') return null;
+  const path = require('path');
+  const fs = require('fs');
+  const home = os.homedir();
+  if (!home) return null;
+
+  const localBin = path.join(home, '.local', 'bin');
+  const pathCandidates = [];
+  const pathEnv = process.env.PATH || '';
+  for (const seg of pathEnv.split(path.delimiter)) {
+    if (!seg) continue;
+    const abs = path.resolve(seg);
+    if (abs.startsWith(home + path.sep) && !pathCandidates.includes(abs)) {
+      pathCandidates.push(abs);
+    }
+  }
+  // If ~/.local/bin is already on PATH, keep it first (preserves existing UX
+  // for the common case). Otherwise prefer PATH-backed HOME dirs first so we
+  // self-link somewhere actually on PATH, falling back to ~/.local/bin only
+  // when no on-PATH HOME dir is writable. (#2775 CodeRabbit follow-up)
+  const candidates = pathCandidates.includes(localBin)
+    ? [localBin, ...pathCandidates.filter((dir) => dir !== localBin)]
+    : [...pathCandidates, localBin];
+
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const target = path.join(dir, 'gsd-sdk');
+      // Replace any existing entry — it may be stale (prior install of an
+      // older version pointing at a now-absent shim).
+      try { fs.unlinkSync(target); } catch {}
+      try {
+        fs.symlinkSync(shimSrc, target);
+      } catch {
+        // Filesystems that don't support symlinks (some FUSE mounts): write a
+        // tiny wrapper that `require()`s the real shim by absolute path. We
+        // cannot copyFileSync(shimSrc, target) — bin/gsd-sdk.js resolves the
+        // CLI via `path.resolve(__dirname, '..', 'sdk', 'dist', 'cli.js')`,
+        // and after a copy `__dirname` would be the link directory (e.g.
+        // ~/.local/bin), causing the resolved CLI path to be broken
+        // (~/.local/sdk/dist/cli.js). Wrapping via require() preserves
+        // __dirname resolution because the require runs against shimSrc's
+        // own location. (#2775 CodeRabbit follow-up)
+        fs.writeFileSync(
+          target,
+          `#!/usr/bin/env node\nrequire(${JSON.stringify(shimSrc)});\n`,
+        );
+        try { fs.chmodSync(target, 0o755); } catch {}
+      }
+      return target;
+    } catch {
+      // permission / EROFS — try next candidate.
+    }
+  }
+  return null;
 }
 
 /**
@@ -7532,6 +7698,7 @@ if (process.env.GSD_TEST_MODE) {
     validateHookFields,
     preserveUserArtifacts,
     restoreUserArtifacts,
+    USER_OWNED_ARTIFACTS,
     finishInstall,
     homePathCoveredByRc,
     maybeSuggestPathExport,
