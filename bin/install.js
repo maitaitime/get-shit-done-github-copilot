@@ -484,6 +484,31 @@ function expandTilde(filePath) {
 }
 
 /**
+ * Compute the path prefix used for `@file` references in installed command/skill
+ * markdown. For global installs into a runtime config dir under $HOME, we
+ * normally substitute the home prefix with `$HOME` so paths expand correctly
+ * inside double-quoted shell commands. OpenCode is exempt on every platform:
+ * its `@file` include syntax does NOT shell-expand `$HOME`, so a literal
+ * `@$HOME/...` is treated as a path relative to the config command/ dir, which
+ * resolves to `command/$HOME/...` (file not found). For OpenCode we always emit
+ * the absolute resolved path. (#2376 Windows, #2831 macOS/Linux.)
+ *
+ * @param {object} args
+ * @param {boolean} args.isGlobal - Global runtime install vs local project
+ * @param {boolean} args.isOpencode - Whether the runtime is OpenCode
+ * @param {boolean} args.isWindowsHost - process.platform === 'win32'
+ * @param {string} args.resolvedTarget - Absolute target dir, forward-slashed
+ * @param {string} args.homeDir - User home dir, forward-slashed
+ * @returns {string} pathPrefix ending with '/'
+ */
+function computePathPrefix({ isGlobal, isOpencode, isWindowsHost: _isWindowsHost, resolvedTarget, homeDir }) {
+  if (isGlobal && resolvedTarget.startsWith(homeDir) && !isOpencode) {
+    return '$HOME' + resolvedTarget.slice(homeDir.length) + '/';
+  }
+  return `${resolvedTarget}/`;
+}
+
+/**
  * Build a hook command path using forward slashes for cross-platform compatibility.
  * On Windows, $HOME is not expanded by cmd.exe/PowerShell, so we use the actual path.
  *
@@ -6566,14 +6591,20 @@ function install(isGlobal, runtime = 'claude') {
   // For global installs: use $HOME/ so paths expand correctly inside double-quoted
   // shell commands (~ does NOT expand inside double quotes, causing MODULE_NOT_FOUND).
   // For local installs: use resolved absolute path (may be outside $HOME).
-  // Exception: OpenCode on Windows does not expand $HOME in @file references —
-  // use the absolute path instead so @$HOME/... references resolve correctly (#2376).
+  // Exception: OpenCode does not expand $HOME in @file references on any platform —
+  // `@$HOME/...` is treated as a literal path relative to the config dir, producing
+  // `command/$HOME/...` (file not found). Use the absolute path for OpenCode so
+  // @-references resolve correctly (#2376 Windows, #2831 macOS/Linux).
   const resolvedTarget = path.resolve(targetDir).replace(/\\/g, '/');
   const homeDir = os.homedir().replace(/\\/g, '/');
   const isWindowsHost = process.platform === 'win32';
-  const pathPrefix = isGlobal && resolvedTarget.startsWith(homeDir) && !(isOpencode && isWindowsHost)
-    ? '$HOME' + resolvedTarget.slice(homeDir.length) + '/'
-    : `${resolvedTarget}/`;
+  const pathPrefix = computePathPrefix({
+    isGlobal,
+    isOpencode,
+    isWindowsHost,
+    resolvedTarget,
+    homeDir,
+  });
 
   let runtimeLabel = 'Claude Code';
   if (isOpencode) runtimeLabel = 'OpenCode';
@@ -8147,18 +8178,24 @@ function installSdkIfNeeded(opts) {
     return;
   }
 
-  // #2678: local installs do not write to global node_modules, so the SDK
-  // global-install check is not applicable. Warn and return instead of exiting.
-  if (opts.isLocal) {
-    console.warn(`\n  ${yellow}⚠${reset}  Skipping SDK check for local install — install @gsd-build/sdk globally if you need /gsd-* CLI support.`);
-    return;
-  }
-
   const path = require('path');
   const fs = require('fs');
 
   const sdkDir = opts.sdkDir || path.resolve(__dirname, '..', 'sdk');
   const sdkCliPath = path.join(sdkDir, 'dist', 'cli.js');
+
+  // #2678 / #2829: local installs do not write to global node_modules, so we
+  // cannot fall through to the global-install error path. But the parent
+  // package (which carries bin/gsd-sdk.js and sdk/dist/cli.js) IS available
+  // wherever the installer is running from — npx cache, npm-global, or git
+  // clone. The shim resolves sdk/dist/cli.js relative to its own __dirname,
+  // so a self-link into a user-writable PATH dir makes `gsd-sdk` callable
+  // from local-mode installs too. Only when the dist is genuinely missing
+  // do we bail out with a non-fatal warning.
+  if (opts.isLocal && !fs.existsSync(sdkCliPath)) {
+    console.warn(`\n  ${yellow}⚠${reset}  Skipping SDK check for local install — sdk/dist/cli.js not found at ${sdkCliPath}.`);
+    return;
+  }
 
   if (!fs.existsSync(sdkCliPath)) {
     const ctx = classifySdkInstall(sdkDir);
@@ -8417,6 +8454,7 @@ function installAllRuntimes(runtimes, isGlobal, isInteractive) {
 if (process.env.GSD_TEST_MODE) {
   module.exports = {
     yamlIdentifier,
+    computePathPrefix,
     getCodexSkillAdapterHeader,
     convertClaudeCommandToCursorSkill,
     convertClaudeAgentToCursorAgent,
