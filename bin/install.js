@@ -1123,21 +1123,21 @@ function convertClaudeCommandToCopilotSkill(content, skillName, isGlobal = false
 
 /**
  * Map a skill directory name (gsd-<cmd>) to the frontmatter `name:` used
- * by Claude Code as the skill identity. Workflows emit `Skill(skill="gsd:<cmd>")`
- * (colon form) and Claude Code resolves skills by frontmatter `name:`, not
- * directory name — so emit colon form here. Directory stays hyphenated for
- * Windows path safety. See #2643.
+ * by Claude Code as the skill identity. Emits the hyphen form (gsd-<cmd>)
+ * so Claude Code autocomplete shows the canonical invocation form, not the
+ * deprecated colon form. See #2808.
+ *
+ * Historical note: this previously returned `gsd:<cmd>` (colon) because
+ * workflows called Skill(skill="gsd:<cmd>"). Those calls have been updated
+ * to use hyphen form (#2808) so the colon rewrite is no longer needed.
  *
  * Codex must NOT use this helper: its adapter invokes skills as `$gsd-<cmd>`
- * (shell-var syntax) and a colon would terminate the variable name. Codex
- * keeps the hyphen form via `yamlQuote(skillName)` directly.
+ * (shell-var syntax) — hyphen form is already correct there.
  */
 function skillFrontmatterName(skillDirName) {
   if (typeof skillDirName !== 'string') return skillDirName;
-  // Idempotent on already-colon form.
-  if (skillDirName.includes(':')) return skillDirName;
-  // Only rewrite the first hyphen after the `gsd` prefix.
-  return skillDirName.replace(/^gsd-/, 'gsd:');
+  // Return the hyphen form as-is (gsd-<cmd>) — canonical since #2808.
+  return skillDirName;
 }
 
 /**
@@ -2628,6 +2628,11 @@ function getTomlTableSections(content) {
 
   return headerLines.map((record, index) => ({
     path: record.tableHeader.path,
+    // segments preserves the true parsed key count so callers that need to
+    // distinguish a 2-segment path like hooks."before.tool" from a 3-segment
+    // path like hooks.SessionStart.hooks can do so without splitting on dots
+    // (which misclassifies quoted key names that contain dot characters).
+    segments: record.tableHeader.segments,
     array: record.tableHeader.array,
     start: record.start,
     headerEnd: record.end + record.eol.length,
@@ -2891,40 +2896,133 @@ function stripLeakedGsdCodexSections(content) {
 function migrateCodexHooksMapFormat(content) {
   const sections = getTomlTableSections(content);
 
-  // Find all non-array hooks sections: [hooks] or [hooks.TYPE]
-  const legacyHooksSections = sections.filter(
-    (section) => !section.array && (section.path === 'hooks' || section.path.startsWith('hooks.'))
+  // Find all non-array hooks sections: bare [hooks] container or [hooks.TYPE] event tables.
+  // Use section.segments (parsed key count) rather than section.path.startsWith() so that
+  // nested handler tables like [hooks.SessionStart.hooks] (3 segments) are not mistakenly
+  // included and re-emitted as an event named "SessionStart.hooks".
+  const legacyMapSections = sections.filter(
+    (section) => !section.array && (
+      section.path === 'hooks' ||
+      (section.path.startsWith('hooks.') && section.segments.length === 2)
+    )
   );
 
-  if (legacyHooksSections.length === 0) {
+  // Find flat [[hooks]] array-of-tables entries (path === 'hooks', array === true).
+  // These are incompatible with [[hooks.<EVENT>]] namespaced form — both cannot
+  // coexist in the same TOML file because `hooks` cannot be simultaneously an
+  // array and a table. Migrate each flat entry to [[hooks.<EVENT>]] form using
+  // the `event` key as the event name.
+  const flatAotSections = sections.filter(
+    (section) => section.array && section.path === 'hooks'
+  );
+
+  // Find [[hooks.TYPE]] namespaced AoT entries that carry handler fields
+  // (command, type, timeout, statusMessage) at event-entry level but have no
+  // [[hooks.TYPE.hooks]] sub-table. This is the pre-#2773 single-block shape
+  // that Codex 0.124.0+ rejects. Promote them to the two-level nested form.
+  // Entries that already have a [[hooks.TYPE.hooks]] sub-table are left untouched.
+  // Matcher-only entries (no handler fields) are intentionally valid and skipped.
+  const STALE_HANDLER_FIELD_PATTERN = /^\s*(?:command|type|timeout|statusMessage)\s*=/m;
+  const staleNamespacedAotSections = sections.filter((section) => {
+    if (!section.array) return false;
+    if (!section.path.startsWith('hooks.')) return false;
+    // [[hooks.TYPE.hooks]] sub-tables have 3 parsed segments — skip them.
+    // Use section.segments (true parsed key count) rather than splitting
+    // section.path on '.', which misclassifies quoted event names that contain
+    // dots (e.g. [[hooks."before.tool"]] has segments ['hooks','before.tool']
+    // but path 'hooks.before.tool' would split into 3 parts).
+    if (section.segments.length !== 2) return false;
+    // Must carry at least one handler field at event-entry level.
+    const body = content.slice(section.headerEnd, section.end);
+    if (!STALE_HANDLER_FIELD_PATTERN.test(body)) return false;
+    // Don't migrate when the nested [[hooks.TYPE.hooks]] sub-table already exists.
+    const subPath = section.path + '.hooks';
+    return !sections.some((s) => s.array && s.path === subPath);
+  });
+
+  if (legacyMapSections.length === 0 && flatAotSections.length === 0 && staleNamespacedAotSections.length === 0) {
     return content;
   }
 
   const eol = detectLineEnding(content);
 
-  // Build [[hooks]] blocks for each [hooks.TYPE] section (skipping bare [hooks])
-  const newHooksBlocks = [];
-  for (const section of legacyHooksSections) {
-    if (section.path === 'hooks') {
-      // Bare [hooks] container — drop it (no key-value content to convert)
-      continue;
+  // Helper: parse a hooks body into event-level and handler-level entries,
+  // returning { eventEntries, handlerEntries, hasExplicitType }.
+  // Event-level keys: matcher. Everything else is handler-level.
+  // The `event` key (used in flat [[hooks]] blocks) is consumed as the type
+  // name and excluded from both levels.
+  const EVENT_LEVEL_KEYS = new Set(['matcher']);
+  function parseHooksBody(body, skipKeys = new Set()) {
+    const bodyLines = body.split(/\r?\n/);
+    const eventEntries = [];
+    const handlerEntries = [];
+    let hasExplicitType = false;
+    for (const line of bodyLines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      // Use parseTomlKey so hyphenated keys (e.g. status-message) and quoted
+      // keys are recognised — the old /^([\w.]+)\s*=/ regex silently dropped them.
+      const parsed = parseTomlKey(trimmed);
+      if (!parsed) continue;
+      // Hook body keys are always single-segment; use segments[0] for the name.
+      const key = parsed.segments[0];
+      if (skipKeys.has(key)) continue;
+      if (key === 'type') {
+        hasExplicitType = true;
+        handlerEntries.push(trimmed);
+      } else if (EVENT_LEVEL_KEYS.has(key)) {
+        eventEntries.push(trimmed);
+      } else {
+        handlerEntries.push(trimmed);
+      }
     }
-
-    // Extract the type from the path: "hooks.shell" → "shell"
-    const type = section.path.slice('hooks.'.length);
-    const body = content.slice(section.headerEnd, section.end);
-
-    // #2760 CR5 finding 3 — emit the namespaced AoT form directly:
-    // `[[hooks.<TYPE>]]` (no synthetic `event` field — the namespace IS the
-    // event). Previously we emitted flat `[[hooks]]\nevent = "<TYPE>"`,
-    // which produced mixed flat + namespaced layouts when the user already
-    // had `[[hooks.<OTHER>]]` entries. With every migration emit using the
-    // namespaced shape, the managed-emit detector
-    // (`hasUserNamespacedAotHooks`) fires correctly and the install
-    // converges on a single hook layout.
-    const block = `[[hooks.${type}]]${eol}${body}`;
-    newHooksBlocks.push(block);
+    return { eventEntries, handlerEntries, hasExplicitType };
   }
+
+  // TOML key quoting: bare keys may only contain [A-Za-z0-9_-]. Event names
+  // containing spaces, dots, or other punctuation must be wrapped in double-
+  // quoted TOML strings with backslash and double-quote characters escaped.
+  // Using raw event names in [[hooks.${type}]] headers produces invalid TOML
+  // for any non-bare-key character (e.g. "Before Tool" → [[hooks.Before Tool]]).
+  function tomlBareKey(key) {
+    if (/^[A-Za-z0-9_-]+$/.test(key)) return key;
+    return '"' + key.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  }
+
+  function buildNestedBlock(type, body, skipKeys = new Set()) {
+    const quotedType = tomlBareKey(type);
+    const { eventEntries, handlerEntries, hasExplicitType } = parseHooksBody(body, skipKeys);
+    const eventBody = eventEntries.length > 0 ? eventEntries.join(eol) + eol : '';
+    // If no handler fields were found (e.g. matcher-only entry), do not synthesise
+    // an empty [[hooks.TYPE.hooks]] block — that would produce structurally valid
+    // TOML but semantically broken output (a handler entry with no command).
+    if (handlerEntries.length === 0) {
+      return `[[hooks.${quotedType}]]${eol}${eventBody}`;
+    }
+    if (!hasExplicitType) handlerEntries.unshift('type = "command"');
+    const handlerBody = handlerEntries.join(eol) + eol;
+    return `[[hooks.${quotedType}]]${eol}${eventBody}${eol}[[hooks.${quotedType}.hooks]]${eol}${handlerBody}`;
+  }
+
+  // Extract the event name from a flat [[hooks]] section body.
+  // Returns null if no `event` key is found, if the value is an empty string, or if
+  // the quoting is unrecognised. Both TOML double-quoted ("...") and single-quoted
+  // ('...') strings are accepted. An empty event string (event = "" or event = '')
+  // is explicitly rejected — it cannot be meaningfully namespaced and is left untouched.
+  function extractFlatHookEventName(body) {
+    const TOML_EVENT_CAPTURE = /^\s*event\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/m;
+    const m = body.match(TOML_EVENT_CAPTURE);
+    if (!m) return null;
+    const name = (m[1] ?? m[2] ?? '').trim();
+    return name || null;
+  }
+
+  const migratedFlatAotSections = flatAotSections.filter((section) => {
+    const body = content.slice(section.headerEnd, section.end);
+    return extractFlatHookEventName(body) !== null;
+  });
+
+  const legacyHooksSections = [...legacyMapSections, ...migratedFlatAotSections, ...staleNamespacedAotSections];
 
   // Remove all legacy hooks sections from the content
   let result = removeContentRanges(
@@ -2933,28 +3031,43 @@ function migrateCodexHooksMapFormat(content) {
   );
   result = collapseTomlBlankLines(result);
 
-  // Insert new [[hooks]] blocks at the position of the first legacy section
-  // (adjusted for removed content), or append if nothing remains before EOF.
-  if (newHooksBlocks.length > 0) {
-    const insertionText = newHooksBlocks.join('');
-    // Find a good insertion point: before the first remaining table section
-    // that came after our removed hooks, or just append.
-    const remainingSections = getTomlTableSections(result);
-    const firstHooksSection = legacyHooksSections[0];
-
-    // Find the first remaining section whose original start was after the legacy hooks block
-    const anchorSection = remainingSections.find((s) => {
-      // Use content position in the result string as a heuristic
-      // We insert before the first non-hooks section if any exists
-      return s.start > 0;
+  // Map-format blocks ([hooks.TYPE]) are inserted at the position of the first
+  // remaining table section (preserving their relative placement in the file).
+  // Flat AoT blocks ([[hooks]] with event = "...") are always APPENDED because
+  // flat [[hooks]] entries only appear at the END of a TOML file (AoT cannot
+  // precede a regular table), and inserting before the first table would push
+  // them above [features] / [model] etc., corrupting relative ordering.
+  const mapOnlyBlocks = legacyMapSections
+    .filter((s) => s.path !== 'hooks')   // skip bare [hooks] container
+    .map((s) => {
+      const type = s.path.slice('hooks.'.length);
+      const body = content.slice(s.headerEnd, s.end);
+      return buildNestedBlock(type, body);
     });
 
-    // Prefer to insert the new blocks right before the first remaining table
-    // that was originally positioned after the legacy hooks area, but since
-    // positions shift after removal, we simply append before the first table
-    // header or at end-of-file.
+  // Stale namespaced AoT blocks: [[hooks.TYPE]] entries with handler fields at
+  // event-entry level (no .hooks sub-table). Treated like map-format blocks —
+  // inserted before the first remaining table section.
+  const staleNamespacedAotBlocks = staleNamespacedAotSections.map((s) => {
+    const type = s.path.slice('hooks.'.length);
+    const body = content.slice(s.headerEnd, s.end);
+    return buildNestedBlock(type, body);
+  });
+
+  const flatAotBlocks = migratedFlatAotSections.map((s) => {
+    const body = content.slice(s.headerEnd, s.end);
+    const eventName = extractFlatHookEventName(body);
+    if (!eventName) return '';
+    return buildNestedBlock(eventName, body, new Set(['event']));
+  }).filter(Boolean);
+
+  // Insert map-format and stale-namespaced-AoT conversions before the first
+  // remaining table section (both share the same placement strategy).
+  const allMapStyleBlocks = [...mapOnlyBlocks, ...staleNamespacedAotBlocks];
+  if (allMapStyleBlocks.length > 0) {
+    const insertionText = allMapStyleBlocks.join('');
+    const remainingSections = getTomlTableSections(result);
     if (remainingSections.length > 0) {
-      // Find where to insert: after any leading top-level keys, before first table
       const firstTable = remainingSections[0];
       const before = result.slice(0, firstTable.start);
       const after = result.slice(firstTable.start);
@@ -2966,7 +3079,23 @@ function migrateCodexHooksMapFormat(content) {
         (needsTrailingGap ? eol : '') +
         after;
     } else {
-      // No remaining sections — append
+      const needsGap = result.length > 0 && !result.endsWith(eol + eol);
+      result = result + (needsGap ? eol : '') + insertionText;
+    }
+  }
+
+  // Insert flat-AoT conversions before the GSD managed marker (if present) so
+  // the migrated user hooks stay in the "user" portion of the file and are not
+  // swept away when stripGsdFromCodexConfig strips from the marker to EOF.
+  // If no marker exists, append at the end of the file.
+  if (flatAotBlocks.length > 0) {
+    const insertionText = flatAotBlocks.join('');
+    const markerIdx = result.indexOf(GSD_CODEX_MARKER);
+    if (markerIdx !== -1) {
+      const before = result.slice(0, markerIdx).trimEnd();
+      const after = result.slice(markerIdx);
+      result = before + eol + eol + insertionText + eol + after;
+    } else {
       const needsGap = result.length > 0 && !result.endsWith(eol + eol);
       result = result + (needsGap ? eol : '') + insertionText;
     }
@@ -3400,14 +3529,63 @@ function validateCodexConfigSchema(content) {
   }
 
   // Structural confirmation against parsed object: any present hooks.<Event>
-  // must be an array.
-  if (parsed.hooks && typeof parsed.hooks === 'object' && !Array.isArray(parsed.hooks)) {
-    for (const [event, value] of Object.entries(parsed.hooks)) {
-      if (!Array.isArray(value)) {
-        return {
-          ok: false,
-          reason: `hooks.${event} must be an array of tables, got ${typeof value}`,
-        };
+  // must be an array, and flat top-level [[hooks]] (parsed as Array on root)
+  // is rejected — Codex 0.124.0+ requires [[hooks.<Event>]] namespaced form.
+  if (parsed.hooks !== undefined) {
+    if (Array.isArray(parsed.hooks)) {
+      return {
+        ok: false,
+        reason: 'flat [[hooks]] array-of-tables is invalid in Codex 0.124.0+ (expected [[hooks.<Event>]] namespaced form)',
+      };
+    }
+    if (typeof parsed.hooks === 'object' && parsed.hooks !== null) {
+      for (const [event, value] of Object.entries(parsed.hooks)) {
+        // Skip the nested .hooks sub-array — it lives under hooks.<Event>[n].hooks
+        // and is validated separately below.
+        if (!Array.isArray(value)) {
+          return {
+            ok: false,
+            reason: `hooks.${event} must be an array of tables, got ${typeof value}`,
+          };
+        }
+        // Each entry in hooks.<Event> must either be a matcher-only filter (no
+        // handler fields) or carry a .hooks sub-array of handler tables.
+        // Entries with handler fields (command, type, timeout, statusMessage) at
+        // event-entry level but without a .hooks sub-table are the pre-#2773
+        // single-block shape that Codex 0.124.0+ rejects. migrateCodexHooksMapFormat
+        // converts these before validation runs; their presence here means migration
+        // failed to cover this entry — fail loudly rather than pass a broken config.
+        const HANDLER_FIELD_NAMES = new Set(['command', 'type', 'timeout', 'statusMessage']);
+        for (const entry of value) {
+          if (!entry || typeof entry !== 'object') continue;
+          if (entry.hooks === undefined) {
+            const strayKey = Object.keys(entry).find((k) => HANDLER_FIELD_NAMES.has(k));
+            if (strayKey) {
+              return {
+                ok: false,
+                reason: `hooks.${event}[] entry has handler field "${strayKey}" at event-entry level; ` +
+                  `Codex 0.124.0+ requires handler fields nested under [[hooks.${event}.hooks]]`,
+              };
+            }
+            continue;
+          }
+          if (!Array.isArray(entry.hooks)) {
+            return {
+              ok: false,
+              reason: `hooks.${event}[].hooks must be an array of handler tables, got ${typeof entry.hooks}`,
+            };
+          }
+          for (const handler of entry.hooks) {
+            if (handler && typeof handler === 'object' && handler.type !== undefined) {
+              if (handler.type !== 'command') {
+                return {
+                  ok: false,
+                  reason: `hooks.${event}[].hooks[].type must be "command", got "${handler.type}"`,
+                };
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -6697,14 +6875,23 @@ function install(isGlobal, runtime = 'claude') {
         content = processAttribution(content, getCommitAttribution(runtime));
         // Convert frontmatter for runtime compatibility (agents need different handling)
         if (isOpencode) {
-          // Resolve per-agent model override from BOTH per-project
-          // `.planning/config.json` and `~/.gsd/defaults.json`, with
-          // per-project winning on conflict (#2256). Without the per-project
-          // probe, an override set in `.planning/config.json` was silently
-          // ignored and the child inherited OpenCode's default model.
+          // Resolve per-agent model for OpenCode agents.
+          // Precedence: model_overrides[agent] > model_profile_overrides.opencode.<tier> > omit.
+          // model_overrides (#2256): explicit per-agent override, highest precedence.
+          // model_profile_overrides (#2794): tier-based runtime resolver, same parity as Codex.
           const _ocAgentName = entry.name.replace(/\.md$/, '');
           const _ocModelOverrides = readGsdEffectiveModelOverrides(targetDir);
-          const _ocModelOverride = _ocModelOverrides?.[_ocAgentName] || null;
+          let _ocModelOverride = _ocModelOverrides?.[_ocAgentName] || null;
+          if (!_ocModelOverride) {
+            // Fall back to tier-based resolution via model_profile_overrides.opencode.<tier>.
+            const _ocRuntimeResolver = readGsdRuntimeProfileResolver(targetDir);
+            if (_ocRuntimeResolver) {
+              const _ocEntry = _ocRuntimeResolver.resolve(_ocAgentName);
+              if (_ocEntry?.model) {
+                _ocModelOverride = _ocEntry.model;
+              }
+            }
+          }
           content = convertClaudeToOpencodeFrontmatter(content, { isAgent: true, modelOverride: _ocModelOverride });
         } else if (isKilo) {
           content = convertClaudeToKiloFrontmatter(content, { isAgent: true });
@@ -6973,62 +7160,64 @@ function install(isGlobal, runtime = 'claude') {
       let configContent = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : '';
       const eol = detectLineEnding(configContent);
 
-      // Migrate legacy [hooks] map format to [[hooks]] array-of-tables (#2637).
-      // Codex 0.124.0 requires [[hooks]] array-of-tables; old GSD installs wrote
-      // [hooks.shell] map tables which now cause a startup parse error.
+      // Strip ALL prior GSD-managed hook blocks BEFORE migration so the migration
+      // only touches user-authored hooks, not GSD-owned stale entries. Running
+      // strip after migration causes Shape 1 (legacy gsd-update-check filename)
+      // to be converted by migration before the strip regex can match it (#2698).
+      //
+      // Historical shapes stripped, in order:
+      //   Shape 1 — legacy gsd-update-check filename (pre-#1755): flat [[hooks]] + event
+      //   Shape 2 — flat [[hooks]] + event = "SessionStart" (#2637 era, never correct)
+      //   Shape 4 — correct two-block nested (strip before shape 3 to avoid orphaned header)
+      //   Shape 3 — single-block [[hooks.SessionStart]] without nested .hooks (#2760 era)
+      if (configContent.includes('gsd-update-check') || configContent.includes('gsd-check-update')) {
+        // Shape 1
+        configContent = configContent.replace(
+          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\]\]\r?\nevent = "SessionStart"\r?\ncommand = "node [^\r\n]*gsd-update-check\.js"\r?\n/gm,
+          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
+        );
+        // Shape 2
+        configContent = configContent.replace(
+          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\]\]\r?\nevent = "SessionStart"\r?\ncommand = "node [^\r\n]*gsd-check-update\.js"\r?\n/gm,
+          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
+        );
+        // Shape 4 — strip before shape 3 to avoid orphaned header
+        configContent = configContent.replace(
+          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\.SessionStart\]\]\r?\n\r?\n\[\[hooks\.SessionStart\.hooks\]\]\r?\ntype = "command"\r?\ncommand = "node [^\r\n]*(?:gsd-check-update|gsd-update-check)\.js"\r?\n/gm,
+          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
+        );
+        // Shape 3
+        configContent = configContent.replace(
+          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\.SessionStart\]\]\r?\ncommand = "node [^\r\n]*(?:gsd-check-update|gsd-update-check)\.js"\r?\n/gm,
+          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
+        );
+      }
+
+      // Migrate legacy [hooks] map format and flat [[hooks]] AoT entries to the
+      // namespaced [[hooks.<EVENT>]] form after stripping GSD-managed stale blocks.
+      // Running migration after strip ensures only user-authored hooks are migrated
+      // (#2698 regression: migration before strip converts stale GSD blocks before
+      // the strip regexes can match their original shape).
       const migratedContent = migrateCodexHooksMapFormat(configContent);
       if (migratedContent !== configContent) {
         configContent = migratedContent;
-        console.log(`  ${green}✓${reset} Migrated legacy Codex [hooks] map format to [[hooks]] array-of-tables`);
+        console.log(`  ${green}✓${reset} Migrated legacy Codex [hooks] format to two-level nested AoT`);
       }
 
       const codexHooksFeature = ensureCodexHooksFeature(configContent);
       configContent = setManagedCodexHooksOwnership(codexHooksFeature.content, codexHooksFeature.ownership);
 
-      // Add SessionStart hook for update checking. Default to top-level
-      // `[[hooks]]` AoT with `event` field — the form GSD has emitted since
-      // the Codex 0.124 migration (#2637). When the user already uses the
-      // namespaced AoT form `[[hooks.SessionStart]]` for their own hooks,
-      // emit our managed entry in that same shape so the two forms don't
-      // collide on round-trip (#2760, defect 3).
+      // Add SessionStart hook for update checking. Codex 0.124.0+ requires the
+      // two-level nested AoT schema: [[hooks.SessionStart]] for the event entry
+      // (holds optional matcher) and [[hooks.SessionStart.hooks]] for the handler
+      // (holds type, command, statusMessage, timeout). (#2637, #2760, #2773)
       const updateCheckScript = path.resolve(targetDir, 'hooks', 'gsd-check-update.js').replace(/\\/g, '/');
-      const useNamespacedAot = hasUserNamespacedAotHooks(configContent, 'SessionStart');
-      const hookBlock = useNamespacedAot
-        ? `${eol}# GSD Hooks${eol}` +
-          `[[hooks.SessionStart]]${eol}` +
-          `command = "node ${updateCheckScript}"${eol}`
-        : `${eol}# GSD Hooks${eol}` +
-          `[[hooks]]${eol}` +
-          `event = "SessionStart"${eol}` +
-          `command = "node ${updateCheckScript}"${eol}`;
-
-      // Migrate legacy gsd-update-check entries from prior installs (#1755 followup)
-      // Remove stale hook blocks that used the inverted filename or wrong path.
-      // Single \r?\n-aware regex handles LF, CRLF, and block-at-file-start (#2698).
-      if (configContent.includes('gsd-update-check')) {
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\]\]\r?\nevent = "SessionStart"\r?\ncommand = "node [^\r\n]*gsd-update-check\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-      }
-
-      // #2760 CR4 finding 2 — Strip ALL existing managed gsd-check-update
-      // hook blocks (top-level [[hooks]] AND namespaced [[hooks.SessionStart]])
-      // BEFORE evaluating the includes guard. Without this, an install that
-      // already has a legacy flat [[hooks]] block short-circuits the new
-      // namespaced AoT emit and stays stuck in the mixed layout this fix is
-      // designed to eliminate. Stripping first means every install converges
-      // on the right shape regardless of prior state.
-      if (configContent.includes('gsd-check-update')) {
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\]\]\r?\nevent = "SessionStart"\r?\ncommand = "node [^\r\n]*gsd-check-update\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\.SessionStart\]\]\r?\ncommand = "node [^\r\n]*gsd-check-update\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-      }
+      const hookBlock = `${eol}# GSD Hooks${eol}` +
+        `[[hooks.SessionStart]]${eol}` +
+        `${eol}` +
+        `[[hooks.SessionStart.hooks]]${eol}` +
+        `type = "command"${eol}` +
+        `command = "node ${updateCheckScript}"${eol}`;
 
       if (hasEnabledCodexHooksFeature(configContent) && !configContent.includes('gsd-check-update')) {
         configContent += hookBlock;
