@@ -36,6 +36,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   optional `dry_run` boolean and the same publish-verification gate as `release.yml`. (#2828)
 
 ### Changed
+- **Canary release workflow now publishes from `dev` branch only** — `.github/workflows/canary.yml`
+  swaps its four publish-step guards from `refs/heads/main` to `refs/heads/dev`. Aligns the
+  workflow with the new branch→dist-tag policy (`dev` → `@canary`, `main` → `@next`/`@latest`).
+  Added a header comment documenting the policy. `workflow_dispatch` runs on `main` (or any
+  other branch) now complete build/test/dry-run validation but skip publish + tag, instead
+  of the previous behaviour where `main` published and `dev` silently no-op'd. (#2868)
 - **Skill descriptions trimmed to ≤ 100 chars across all `commands/gsd/*.md`** — three
   anti-patterns eliminated: flag documentation already present in `argument-hint:` (e.g.
   `discuss-phase` was 380 chars, now 76), `Triggers:` keyword-stuffing lists, and
@@ -45,6 +51,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (#2789)
 
 ### Fixed
+- **GSD slash command namespace drift cleaned up across docs, workflows, and autocomplete** — remaining active `/gsd:<cmd>` references now use canonical `/gsd-<cmd>`, escaped workflow `Skill(skill=\"gsd:...\")` prompts now use hyphenated skill names, `scripts/fix-slash-commands.cjs` rewrites retired colon syntax to hyphen syntax, and the extract-learnings command file now uses `extract-learnings.md` so generated Claude/Qwen skill autocomplete exposes `gsd-extract-learnings` instead of `gsd-extract_learnings`. (#2855)
 - **`extractCurrentMilestone` no longer truncates ROADMAP.md at heading-like lines inside fenced code blocks** — the milestone-end search now scans line-by-line while tracking ` ``` ` / `~~~` fence state, so a line like `# Ops runbook (v1.0 compat)` inside a code block no longer acts as a milestone boundary. Previously, any phase defined after such a block was invisible to `roadmap analyze`, `roadmap get-phase`, `/gsd-autonomous`, and all phase-number commands. (#2787)
 - **Codex install no longer corrupts existing `~/.codex/config.toml`** — the installer
   now defensively strips legacy `[agents]` (single-bracket) and `[[agents]]` (sequence)

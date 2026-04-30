@@ -1137,7 +1137,11 @@ function convertClaudeCommandToCopilotSkill(content, skillName, isGlobal = false
   }
 
   // Reconstruct frontmatter in Copilot format
-  let fm = `---\nname: ${skillName}\ndescription: ${description}\n`;
+  // #2876: descriptions starting with a YAML flow indicator (`[BETA] …`,
+  // `{ … }`, `*ref`, `&anchor`, etc.) parse as flow sequences/mappings and
+  // crash gh-copilot's frontmatter loader. Always quote so any leading
+  // character is parser-safe.
+  let fm = `---\nname: ${skillName}\ndescription: ${yamlQuote(description)}\n`;
   if (argumentHint) fm += `argument-hint: ${yamlQuote(argumentHint)}\n`;
   if (agent) fm += `agent: ${agent}\n`;
   if (toolsLine) fm += `allowed-tools: ${toolsLine}\n`;
@@ -1169,8 +1173,8 @@ function skillFrontmatterName(skillDirName) {
  * Convert a Claude command (.md) to a Claude skill (SKILL.md).
  * Claude Code is the native format, so minimal conversion needed —
  * preserve allowed-tools as YAML multiline list, preserve argument-hint.
- * Emits `name: gsd:<cmd>` (colon) so Skill(skill="gsd:<cmd>") calls in
- * workflows resolve on flat-skills installs — see #2643.
+ * Emits `name: gsd-<cmd>` (hyphen) so Skill(skill="gsd-<cmd>") calls and
+ * tab autocomplete use the canonical command namespace.
  */
 function convertClaudeCommandToClaudeSkill(content, skillName) {
   const { frontmatter, body } = extractFrontmatterAndBody(content);
@@ -1223,8 +1227,10 @@ function convertClaudeAgentToCopilotAgent(content, isGlobal = false) {
     ? "['" + uniqueTools.join("', '") + "']"
     : '[]';
 
-  // Reconstruct frontmatter in Copilot format
-  let fm = `---\nname: ${name}\ndescription: ${description}\ntools: ${toolsArray}\n`;
+  // Reconstruct frontmatter in Copilot format. Quote description (#2876)
+  // so a leading YAML flow indicator (`[BETA] …`, `{ … }`, etc.) doesn't
+  // crash the Copilot frontmatter loader.
+  let fm = `---\nname: ${name}\ndescription: ${yamlQuote(description)}\ntools: ${toolsArray}\n`;
   if (color) fm += `color: ${color}\n`;
   fm += '---';
 
@@ -1277,7 +1283,9 @@ function convertClaudeCommandToAntigravitySkill(content, skillName, isGlobal = f
   const name = skillName || extractFrontmatterField(frontmatter, 'name') || 'unknown';
   const description = extractFrontmatterField(frontmatter, 'description') || '';
 
-  const fm = `---\nname: ${name}\ndescription: ${description}\n---`;
+  // #2876: quote description so YAML flow indicators in the source
+  // (e.g. `[BETA] …`) don't break downstream frontmatter parsers.
+  const fm = `---\nname: ${name}\ndescription: ${yamlQuote(description)}\n---`;
   return `${fm}\n${body}`;
 }
 
@@ -1299,7 +1307,8 @@ function convertClaudeAgentToAntigravityAgent(content, isGlobal = false) {
   const claudeTools = toolsRaw.split(',').map(t => t.trim()).filter(Boolean);
   const mappedTools = claudeTools.map(t => convertGeminiToolName(t)).filter(Boolean);
 
-  let fm = `---\nname: ${name}\ndescription: ${description}\ntools: ${mappedTools.join(', ')}\n`;
+  // #2876: quote description for the same reason as the skill variant.
+  let fm = `---\nname: ${name}\ndescription: ${yamlQuote(description)}\ntools: ${mappedTools.join(', ')}\n`;
   if (color) fm += `color: ${color}\n`;
   fm += '---';
 
@@ -1799,7 +1808,9 @@ function convertClaudeCommandToTraeSkill(content, skillName) {
   }
   description = toSingleLine(description);
   const shortDescription = description.length > 180 ? `${description.slice(0, 177)}...` : description;
-  return `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${shortDescription}\n---\n${body}`;
+  // #2876: quote so YAML flow indicators (`[BETA] …`) don't break Trae's
+  // frontmatter parser.
+  return `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${yamlQuote(shortDescription)}\n---\n${body}`;
 }
 
 function convertClaudeAgentToTraeAgent(content) {
@@ -1852,7 +1863,9 @@ function convertClaudeCommandToCodebuddySkill(content, skillName) {
   }
   description = toSingleLine(description);
   const shortDescription = description.length > 180 ? `${description.slice(0, 177)}...` : description;
-  return `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${shortDescription}\n---\n${body}`;
+  // #2876: quote so YAML flow indicators (`[BETA] …`) don't break
+  // CodeBuddy's frontmatter parser.
+  return `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${yamlQuote(shortDescription)}\n---\n${body}`;
 }
 
 function convertClaudeAgentToCodebuddyAgent(content) {
@@ -2893,6 +2906,129 @@ function stripLeakedGsdCodexSections(content) {
 
   cleaned += content.slice(cursor);
   return collapseTomlBlankLines(cleaned);
+}
+
+/**
+ * Strip GSD-managed legacy Codex hook blocks from a config.toml string
+ * using the TOML AST already used elsewhere in this file
+ * (`getTomlTableSections` + `removeContentRanges`). The earlier regex-based
+ * implementation required a precise key order, exact single-space padding
+ * around `=`, and exactly one blank line between Shape 4's parent/child
+ * tables — any deviation (an extra blank line, key reorder, an added
+ * `timeout` key, `event="SessionStart"` without spaces) silently leaked the
+ * stale block, sometimes corrupting the file by leaving orphaned key=value
+ * lines outside any table.
+ *
+ * The structural approach: find every `hooks*` table whose body contains a
+ * `command = "...gsd-(check-update|update-check).js"` value, remove its
+ * exact byte range, and additionally remove any orphaned parent
+ * `[[hooks.SessionStart]]` whose body becomes empty as a result (Shape 4).
+ * The leading `# GSD Hooks` header line is swallowed by extending the
+ * removal range backward through any single preceding comment line.
+ *
+ * Pure function, exported for test coverage. Returns the input unchanged
+ * if no GSD-managed hook section is present.
+ */
+// Legacy hook command basenames to detect during strip. Template-literal
+// form so install-hooks-copy.test.cjs's quoted-literal guard continues to
+// catch accidental regressions where someone *registers* the inverted
+// `gsd-update-check.js` filename in a Codex hook command.
+const STALE_HOOK_BASENAMES = new Set([
+  `gsd-update-check.js`,
+  `gsd-check-update.js`,
+]);
+function stripStaleGsdHookBlocks(configContent) {
+  const sections = getTomlTableSections(configContent);
+  const lineRecords = getTomlLineRecords(configContent);
+  const hookSections = sections.filter(
+    (s) => s.path === 'hooks' || s.path.startsWith('hooks.')
+  );
+  if (hookSections.length === 0) {
+    return configContent;
+  }
+
+  // A section is GSD-managed if any structural `command` key inside its
+  // body parses to a string whose basename matches `gsd-(check-update|
+  // update-check).js`. The TOML line parser already classified each line's
+  // `keySegments`, so we never inspect raw text — this handles arbitrary
+  // whitespace, key reordering, and additional keys robustly.
+  function sectionHasStaleCommand(section) {
+    const records = lineRecords.filter(
+      (r) => !r.startsInMultilineString
+        && !r.tableHeader
+        && r.start >= section.headerEnd
+        && r.end + r.eol.length <= section.end
+        && r.keySegments
+        && r.keySegments.length === 1
+        && r.keySegments[0] === 'command'
+    );
+    for (const record of records) {
+      const equalsIndex = findTomlAssignmentEquals(record.text);
+      if (equalsIndex === -1) continue;
+      let parsed;
+      try {
+        parsed = parseTomlValue(record.text, equalsIndex + 1);
+      } catch {
+        continue;
+      }
+      if (typeof parsed.value !== 'string') continue;
+      // Match the basename — Codex configs reference these files by absolute
+      // path under the user's `.codex/hooks/` directory.
+      const basename = parsed.value.split(/[\\/]/).pop() || '';
+      if (STALE_HOOK_BASENAMES.has(basename)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const stale = new Set(hookSections.filter(sectionHasStaleCommand));
+  if (stale.size === 0) {
+    return configContent;
+  }
+
+  // Shape 4: a `[[hooks.SessionStart]]` event-table whose body is empty and
+  // whose immediately following section is a stale child handler table
+  // (`[[hooks.SessionStart.hooks]]`) becomes orphaned once the child is
+  // stripped. Detect emptiness via line records — no key/value lines and no
+  // non-blank, non-comment text between this section's header and the next.
+  function sectionBodyHasContent(section) {
+    return lineRecords.some(
+      (r) => !r.startsInMultilineString
+        && !r.tableHeader
+        && r.start >= section.headerEnd
+        && r.end + r.eol.length <= section.end
+        && r.text.trim() !== ''
+        && !r.text.trim().startsWith('#')
+    );
+  }
+  for (let i = 0; i < sections.length; i += 1) {
+    const parent = sections[i];
+    if (stale.has(parent)) continue;
+    if (!parent.array || parent.path !== 'hooks.SessionStart') continue;
+    if (sectionBodyHasContent(parent)) continue;
+    const next = sections[i + 1];
+    if (next && stale.has(next) && next.path.startsWith('hooks.SessionStart.')) {
+      stale.add(parent);
+    }
+  }
+
+  // Each removal range starts at the table header. If the immediately
+  // preceding line is the GSD marker comment `# GSD Hooks` (and is not part
+  // of an already-removed section), extend the range backward to swallow it
+  // — preserves cleanliness on round-trip strip+rewrite.
+  const ranges = [];
+  for (const section of stale) {
+    let start = section.start;
+    const headerLineIdx = lineRecords.findIndex((r) => r.start === section.start);
+    const prev = headerLineIdx > 0 ? lineRecords[headerLineIdx - 1] : null;
+    if (prev && !prev.startsInMultilineString && prev.text.trim() === '# GSD Hooks') {
+      start = prev.start;
+    }
+    ranges.push({ start, end: section.end });
+  }
+
+  return collapseTomlBlankLines(removeContentRanges(configContent, ranges));
 }
 
 /**
@@ -4194,6 +4330,84 @@ function stripSubTags(content) {
  * - skills: must be removed (causes validation error)
  * - mcp__* tools: must be excluded (auto-discovered at runtime)
  */
+let _gsdCommandRoster = null;
+let _gsdCommandRosterWarned = false;
+
+/**
+ * Get the list of known GSD commands from the source directory.
+ * Caches the result after the first scan. Emits a one-shot warning if the
+ * source directory cannot be located — an empty roster silently neutralises
+ * every Gemini slash-command conversion, which is the bug this code exists
+ * to prevent. The warning is gated on GSD_TEST_MODE to keep test output clean.
+ * @returns {Set<string>} Set of command names (without .md extension)
+ */
+function getGsdCommandRoster() {
+  if (_gsdCommandRoster) return _gsdCommandRoster;
+  const baseDir = (typeof __dirname !== 'undefined') ? __dirname : process.cwd();
+  const gsdSrc = path.join(baseDir, '..', 'commands', 'gsd');
+  if (fs.existsSync(gsdSrc)) {
+    _gsdCommandRoster = new Set(
+      fs.readdirSync(gsdSrc)
+        .filter(f => f.endsWith('.md'))
+        .map(f => f.replace('.md', ''))
+    );
+  } else {
+    _gsdCommandRoster = new Set();
+    if (!_gsdCommandRosterWarned && !process.env.GSD_TEST_MODE) {
+      _gsdCommandRosterWarned = true;
+      console.warn(
+        `WARNING: GSD command roster not found at ${gsdSrc}. ` +
+        `Gemini /gsd- → /gsd: conversion will be a no-op. ` +
+        `This usually means the package was installed without commands/gsd/.`
+      );
+    }
+  }
+  return _gsdCommandRoster;
+}
+
+// Test-only: reset the cached roster. Exported via GSD_TEST_MODE bundle below.
+function _resetGsdCommandRoster() {
+  _gsdCommandRoster = null;
+  _gsdCommandRosterWarned = false;
+}
+
+function convertSlashCommandsToGeminiMentions(content) {
+  const commands = getGsdCommandRoster();
+  // Defense in depth: regex boundary AND roster lookup must both agree.
+  //
+  // - Lookbehind `(?<![A-Za-z0-9./])` rejects URLs (`example.com/gsd-…`),
+  //   sub-paths (`bin/gsd-…`), and root-relative file paths preceded by a
+  //   path char. Without it the roster alone is insufficient: a URL like
+  //   `https://example.com/gsd-plan-phase` ends in a known command name and
+  //   would convert incorrectly.
+  // - `(?!\/)` rejects sub-path continuation (`/gsd-foo/bar`).
+  // - `(?!\.[a-z])` rejects file extensions (`.cjs`, `.md`) but PERMITS
+  //   sentence-ending punctuation like `/gsd-help.` because `.` at end of
+  //   string or before whitespace is not followed by a lowercase letter.
+  // - Roster lookup ensures only real commands convert — agent names like
+  //   `gsd-planner` (no leading slash anyway) and unknown tokens pass through.
+  //
+  // GSD commands are always lowercase, so no case-insensitive flag.
+  return content.replace(/(?<![A-Za-z0-9./])\/gsd-([a-z0-9-]+)(?!\/)(?!\.[a-z])/g, (match, commandName) => {
+    return commands.has(commandName) ? `/gsd:${commandName}` : match;
+  });
+}
+
+function convertClaudeToGeminiMarkdown(content, { isCommand = false } = {}) {
+  // Apply Gemini-specific slash command namespacing
+  let converted = convertSlashCommandsToGeminiMentions(content);
+  // Strip HTML subscript tags — terminals can't render them. Done before
+  // TOML conversion so the prompt body of a command file is also clean.
+  converted = stripSubTags(converted);
+
+  if (isCommand) {
+    // Convert to Gemini TOML format
+    converted = convertClaudeToGeminiToml(converted);
+  }
+
+  return converted;
+}
+
 function convertClaudeToGeminiAgent(content) {
   if (!content.startsWith('---')) return content;
 
@@ -4286,7 +4500,9 @@ function convertClaudeToGeminiAgent(content) {
 
   // Runtime-neutral agent name replacement (#766)
   const neutralBody = neutralizeAgentReferences(escapedBody, 'GEMINI.md');
-  return `---\n${newFrontmatter}\n---${stripSubTags(neutralBody)}`;
+  // Apply Gemini-specific transformations (slash commands + sub-tag stripping)
+  const geminiBody = convertClaudeToGeminiMarkdown(neutralBody);
+  return `---\n${newFrontmatter}\n---${geminiBody}`;
 }
 
 function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOverride = null } = {}) {
@@ -5253,10 +5469,13 @@ function restoreUserArtifacts(destDir, saved) {
  * @param {string} destDir - Destination directory
  * @param {string} pathPrefix - Path prefix for file references
  * @param {string} runtime - Target runtime ('claude', 'opencode', 'gemini', 'codex')
+ * @param {boolean} isCommand - Whether the source is a command directory
+ * @param {boolean} isGlobal - Whether the install is global
  */
 function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand = false, isGlobal = false) {
   const isOpencode = runtime === 'opencode';
   const isKilo = runtime === 'kilo';
+  const isGemini = runtime === 'gemini';
   const isCodex = runtime === 'codex';
   const isCopilot = runtime === 'copilot';
   const isAntigravity = runtime === 'antigravity';
@@ -5305,17 +5524,11 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand
           ? convertClaudeToKiloFrontmatter(content)
           : convertClaudeToOpencodeFrontmatter(content);
         fs.writeFileSync(destPath, content);
-      } else if (runtime === 'gemini') {
-        if (isCommand) {
-          // Convert to TOML for Gemini (strip <sub> tags — terminals can't render subscript)
-          content = stripSubTags(content);
-          const tomlContent = convertClaudeToGeminiToml(content);
-          // Replace extension with .toml
-          const tomlPath = destPath.replace(/\.md$/, '.toml');
-          fs.writeFileSync(tomlPath, tomlContent);
-        } else {
-          fs.writeFileSync(destPath, content);
-        }
+      } else if (isGemini) {
+        // Apply Gemini-specific Markdown transformations (slash commands, TOML)
+        const processed = convertClaudeToGeminiMarkdown(content, { isCommand });
+        const finalPath = isCommand ? destPath.replace(/\.md$/, '.toml') : destPath;
+        fs.writeFileSync(finalPath, processed);
       } else if (isCodex) {
         content = convertClaudeToCodexMarkdown(content);
         fs.writeFileSync(destPath, content);
@@ -6537,8 +6750,10 @@ function reportLocalPatches(configDir, runtime = 'claude') {
   if (meta.files && meta.files.length > 0) {
     const reapplyCommand = (runtime === 'opencode' || runtime === 'kilo' || runtime === 'copilot')
       ? '/gsd-reapply-patches'
-      : runtime === 'codex'
-        ? '$gsd-reapply-patches'
+      : runtime === 'gemini'
+        ? '/gsd:reapply-patches'
+        : runtime === 'codex'
+          ? '$gsd-reapply-patches'
         : runtime === 'cursor'
           ? 'gsd-reapply-patches (mention the skill name)'
           : '/gsd-reapply-patches';
@@ -7201,28 +7416,7 @@ function install(isGlobal, runtime = 'claude') {
       //   Shape 2 — flat [[hooks]] + event = "SessionStart" (#2637 era, never correct)
       //   Shape 4 — correct two-block nested (strip before shape 3 to avoid orphaned header)
       //   Shape 3 — single-block [[hooks.SessionStart]] without nested .hooks (#2760 era)
-      if (configContent.includes('gsd-update-check') || configContent.includes('gsd-check-update')) {
-        // Shape 1
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\]\]\r?\nevent = "SessionStart"\r?\ncommand = "node [^\r\n]*gsd-update-check\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-        // Shape 2
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\]\]\r?\nevent = "SessionStart"\r?\ncommand = "node [^\r\n]*gsd-check-update\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-        // Shape 4 — strip before shape 3 to avoid orphaned header
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\.SessionStart\]\]\r?\n\r?\n\[\[hooks\.SessionStart\.hooks\]\]\r?\ntype = "command"\r?\ncommand = "node [^\r\n]*(?:gsd-check-update|gsd-update-check)\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-        // Shape 3
-        configContent = configContent.replace(
-          /(?:\r?\n|^)# GSD Hooks\r?\n\[\[hooks\.SessionStart\]\]\r?\ncommand = "node [^\r\n]*(?:gsd-check-update|gsd-update-check)\.js"\r?\n/gm,
-          (match) => (match.startsWith('\r\n') ? '\r\n' : match.startsWith('\n') ? '\n' : ''),
-        );
-      }
+      configContent = stripStaleGsdHookBlocks(configContent);
 
       // Migrate legacy [hooks] map format and flat [[hooks]] AoT entries to the
       // namespaced [[hooks.<EVENT>]] form after stripping GSD-managed stale blocks.
@@ -7761,6 +7955,7 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
   let command = '/gsd-new-project';
   if (runtime === 'opencode') command = '/gsd-new-project';
   if (runtime === 'kilo') command = '/gsd-new-project';
+  if (runtime === 'gemini') command = '/gsd:new-project';
   if (runtime === 'codex') command = '$gsd-new-project';
   if (runtime === 'copilot') command = '/gsd-new-project';
   if (runtime === 'antigravity') command = '/gsd-new-project';
@@ -8458,12 +8653,16 @@ if (process.env.GSD_TEST_MODE) {
     getCodexSkillAdapterHeader,
     convertClaudeCommandToCursorSkill,
     convertClaudeAgentToCursorAgent,
+    convertClaudeToGeminiMarkdown,
+    convertSlashCommandsToGeminiMentions,
+    _resetGsdCommandRoster,
     convertClaudeToGeminiAgent,
     convertClaudeAgentToCodexAgent,
     generateCodexAgentToml,
     generateCodexConfigBlock,
     stripGsdFromCodexConfig,
     migrateCodexHooksMapFormat,
+    stripStaleGsdHookBlocks,
     hasUserNamespacedAotHooks,
     parseTomlToObject,
     validateCodexConfigSchema,
