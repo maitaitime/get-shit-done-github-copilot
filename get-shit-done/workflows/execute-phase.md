@@ -226,7 +226,7 @@ DEFAULT_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/de
 DEFAULT_BRANCH=${DEFAULT_BRANCH:-main}
 
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-  git switch "$BRANCH_NAME"
+  git switch "$BRANCH_NAME" || { echo "ERROR: Could not switch to existing branch '$BRANCH_NAME'." >&2; exit 1; }
 else
   if ! git fetch --quiet origin "$DEFAULT_BRANCH"; then  # #2916
     git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH" \
@@ -238,12 +238,13 @@ else
   else
     git switch --quiet "$DEFAULT_BRANCH" 2>/dev/null && git merge --ff-only --quiet "origin/$DEFAULT_BRANCH" 2>/dev/null || true
   fi
-  git checkout -b "$BRANCH_NAME" "origin/$DEFAULT_BRANCH"  # pinned base (#2916)
-fi
-
-# Warn only when HEAD did NOT fork from origin/$DEFAULT_BRANCH (merge-base ≠ tip) — #2916.
-if MB=$(git merge-base HEAD "origin/${DEFAULT_BRANCH}" 2>/dev/null) && DT=$(git rev-parse --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}" 2>/dev/null) && [ "$MB" != "$DT" ]; then
-  echo "WARNING: Phase branch '$BRANCH_NAME' does not fork from origin/${DEFAULT_BRANCH}; verify the base is intentional."
+  git checkout -b "$BRANCH_NAME" "origin/$DEFAULT_BRANCH" \
+    || { echo "ERROR: Could not create '$BRANCH_NAME' from origin/$DEFAULT_BRANCH (#2916)." >&2; exit 1; }
+  # Warn only on fresh creation when HEAD did NOT fork from origin/$DEFAULT_BRANCH — #2916.
+  # Skipped on resume because origin may have advanced legitimately since first creation.
+  if MB=$(git merge-base HEAD "origin/${DEFAULT_BRANCH}" 2>/dev/null) && DT=$(git rev-parse --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}" 2>/dev/null) && [ "$MB" != "$DT" ]; then
+    echo "WARNING: Phase branch '$BRANCH_NAME' does not fork from origin/${DEFAULT_BRANCH}; verify the base is intentional."
+  fi
 fi
 ```
 

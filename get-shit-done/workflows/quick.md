@@ -192,7 +192,8 @@ DEFAULT_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/de
 DEFAULT_BRANCH=${DEFAULT_BRANCH:-main}
 
 if git show-ref --verify --quiet "refs/heads/$branch_name"; then
-  git switch "$branch_name"
+  git switch "$branch_name" \
+    || { echo "ERROR: Could not switch to existing quick-task branch '$branch_name'." >&2; exit 1; }
 else
   # Fetch the default branch so origin/$DEFAULT_BRANCH is current. If the fetch
   # fails (offline, no remote, auth failure) AND we have no local copy of
@@ -219,12 +220,14 @@ else
 
   # Always pin the new branch to origin/$DEFAULT_BRANCH so the start point is
   # deterministic regardless of which branch we are currently on (#2916).
-  git checkout -b "$branch_name" "origin/$DEFAULT_BRANCH"
-fi
+  git checkout -b "$branch_name" "origin/$DEFAULT_BRANCH" \
+    || { echo "ERROR: Could not create '$branch_name' from origin/$DEFAULT_BRANCH (#2916)." >&2; exit 1; }
 
-# Warn only when HEAD did NOT fork from origin/$DEFAULT_BRANCH (merge-base ≠ tip) — #2916.
-if MB=$(git merge-base HEAD "origin/${DEFAULT_BRANCH}" 2>/dev/null) && DT=$(git rev-parse --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}" 2>/dev/null) && [ "$MB" != "$DT" ]; then
-  echo "WARNING: Quick-task branch '$branch_name' does not fork from origin/${DEFAULT_BRANCH}; verify the base is intentional before continuing."
+  # Warn only on fresh creation when HEAD did NOT fork from origin/$DEFAULT_BRANCH — #2916.
+  # Skipped on resume because origin may have advanced legitimately since first creation.
+  if MB=$(git merge-base HEAD "origin/${DEFAULT_BRANCH}" 2>/dev/null) && DT=$(git rev-parse --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}" 2>/dev/null) && [ "$MB" != "$DT" ]; then
+    echo "WARNING: Quick-task branch '$branch_name' does not fork from origin/${DEFAULT_BRANCH}; verify the base is intentional before continuing."
+  fi
 fi
 ```
 
