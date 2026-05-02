@@ -526,6 +526,82 @@ function computePathPrefix({ isGlobal, isOpencode, isWindowsHost: _isWindowsHost
 }
 
 /**
+ * Resolve the absolute path to the node binary running the installer.
+ * Used as the runner for .js hooks so they execute in GUI/minimal-PATH
+ * runtimes (Gemini, Antigravity, Codex CLIs launched from a Finder
+ * shortcut etc.) where bare `node` is not on `/usr/bin:/bin:/usr/sbin:/sbin`
+ * and the hook would fail with `node: command not found` (#2979).
+ *
+ * Returns a forward-slash-normalized, double-quoted path so the emitted
+ * command is shell-safe across POSIX and Windows. `process.execPath`
+ * gives the absolute path of the node binary actively running the
+ * installer — that is the version the user just installed under, and
+ * the right default runtime for hooks invoked under the same install.
+ */
+function resolveNodeRunner() {
+  const execPath = typeof process.execPath === 'string' ? process.execPath : '';
+  if (!execPath) return null;
+  // JSON.stringify produces a properly escaped double-quoted shell token,
+  // safe for paths containing spaces or unusual characters.
+  return JSON.stringify(execPath.replace(/\\/g, '/'));
+}
+
+/**
+ * Rewrite legacy `node .../gsd-*.js` command strings in settings.hooks to use
+ * the absolute Node binary path (#2979 follow-up: CR feedback on #3002).
+ *
+ * The original #2979 fix only emitted absolute paths for *newly registered*
+ * hooks. Pre-existing entries kept their bare `node ` prefix on reinstall,
+ * which left them broken under minimal-PATH GUI runtimes — exactly the
+ * failure mode the original fix was meant to close. This walker normalizes
+ * any managed-hook entry whose command starts with bare `node ` to
+ * `<absoluteRunner> <script>` while leaving non-managed and non-bare-node
+ * entries (user-authored hooks, shell scripts, etc.) untouched.
+ *
+ * Returns true if any entry was rewritten.
+ */
+function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner) {
+  if (!settings || !settings.hooks || !absoluteRunner) return false;
+  const MANAGED_HOOK_FILES = new Set([
+    'gsd-check-update.js',
+    'gsd-statusline.js',
+    'gsd-context-monitor.js',
+    'gsd-prompt-guard.js',
+    'gsd-read-guard.js',
+    'gsd-read-injection-scanner.js',
+    'gsd-workflow-guard.js',
+  ]);
+  let changed = false;
+  for (const entries of Object.values(settings.hooks)) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (!entry || !Array.isArray(entry.hooks)) continue;
+      for (const h of entry.hooks) {
+        if (!h || typeof h.command !== 'string') continue;
+        const trimmed = h.command.trim();
+        // Match the EXACT legacy form: `node <script>` with optional quoting.
+        // The previous shape used `trimmed.includes(<filename>)` which would
+        // false-positive on user-authored hooks whose path merely contained
+        // a managed filename as a substring (e.g.
+        // /home/me/scripts/wraps-gsd-check-update.js-and-more.js). #3002 CR.
+        const m = trimmed.match(/^node\s+("([^"]+)"|'([^']+)'|(\S+))\s*$/);
+        if (!m) continue;
+        const scriptToken = m[1];
+        const scriptPath = m[2] || m[3] || m[4] || '';
+        // Take the basename — match against MANAGED_HOOK_FILES by exact
+        // equality, not substring containment. Handles both forward and
+        // backslash separators (Windows).
+        const scriptBase = scriptPath.split(/[\\/]/).pop() || '';
+        if (!MANAGED_HOOK_FILES.has(scriptBase)) continue;
+        h.command = `${absoluteRunner} ${scriptToken}`;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/**
  * Build a hook command path using forward slashes for cross-platform compatibility.
  * On Windows, $HOME is not expanded by cmd.exe/PowerShell, so we use the actual path.
  *
@@ -538,7 +614,16 @@ function computePathPrefix({ isGlobal, isOpencode, isWindowsHost: _isWindowsHost
  */
 function buildHookCommand(configDir, hookName, opts) {
   if (!opts) opts = {};
-  const runner = hookName.endsWith('.sh') ? 'bash' : 'node';
+  // .sh hooks run under /bin/bash (POSIX std PATH always includes /bin),
+  // so bare `bash` is fine. .js hooks need the absolute node path because
+  // GUI-launched runtimes start with a minimal PATH that does not include
+  // nvm/Homebrew/Volta-installed node binaries (#2979).
+  const nodeRunner = resolveNodeRunner();
+  const runner = hookName.endsWith('.sh') ? 'bash' : nodeRunner;
+  // resolveNodeRunner returns null when process.execPath is unavailable.
+  // Fall through with null so callers can skip registration with a warning
+  // instead of emitting bare `node` (which would recreate the #2979 bug).
+  if (runner === null) return null;
 
   if (opts.portableHooks) {
     // Replace the home directory prefix with $HOME so the path works when
@@ -5325,11 +5410,51 @@ function copyCommandsAsClaudeSkills(srcDir, skillsDir, prefix, pathPrefix, runti
 
   fs.mkdirSync(skillsDir, { recursive: true });
 
+  // #2973 (CR follow-up on #3003): preserve user-generated skills across the
+  // wipe-and-replace. `gsd-dev-preferences/SKILL.md` is written by the user
+  // via `/gsd-profile-user --refresh`; it is NOT shipped by the npm package,
+  // so a wipe without snapshot deletes the user's content with nothing to
+  // restore from. Snapshot the SKILL.md (and any sibling files in that
+  // directory) before the wipe and restore them after.
+  const USER_OWNED_SKILLS = new Set(['gsd-dev-preferences']);
+  const preservedUserSkills = new Map(); // skillName -> Map(relPath -> Buffer)
+  for (const skillName of USER_OWNED_SKILLS) {
+    const skillDir = path.join(skillsDir, skillName);
+    if (!fs.existsSync(skillDir)) continue;
+    const files = new Map();
+    const walkSnap = (curRel, curAbs) => {
+      for (const e of fs.readdirSync(curAbs, { withFileTypes: true })) {
+        const childRel = curRel ? path.join(curRel, e.name) : e.name;
+        const childAbs = path.join(curAbs, e.name);
+        if (e.isDirectory()) walkSnap(childRel, childAbs);
+        else if (e.isFile()) files.set(childRel, fs.readFileSync(childAbs));
+      }
+    };
+    walkSnap('', skillDir);
+    if (files.size > 0) preservedUserSkills.set(skillName, files);
+  }
+
   // Remove previous GSD Claude skills to avoid stale command skills
   const existing = fs.readdirSync(skillsDir, { withFileTypes: true });
   for (const entry of existing) {
     if (entry.isDirectory() && entry.name.startsWith(`${prefix}-`)) {
       fs.rmSync(path.join(skillsDir, entry.name), { recursive: true });
+    }
+  }
+
+  // Restore user-owned skills after the wipe but before recursive copy populates
+  // shipped skills. If the npm package later happens to ship a same-named skill
+  // (currently it does not for gsd-dev-preferences), the restored user content
+  // is the source of truth: the recurse() loop below would overwrite it on
+  // collision, but the USER_OWNED_SKILLS set is by definition disjoint from
+  // shipped-skill names.
+  for (const [skillName, files] of preservedUserSkills) {
+    const skillDir = path.join(skillsDir, skillName);
+    fs.mkdirSync(skillDir, { recursive: true });
+    for (const [relPath, buf] of files) {
+      const absPath = path.join(skillDir, relPath);
+      fs.mkdirSync(path.dirname(absPath), { recursive: true });
+      fs.writeFileSync(absPath, buf);
     }
   }
 
@@ -5516,6 +5641,33 @@ function restoreUserArtifacts(destDir, saved) {
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, content, 'utf8');
     } catch { /* skip unwritable paths */ }
+  }
+}
+
+/**
+ * Migrate a legacy dev-preferences.md (saved from commands/gsd/) into the
+ * skills/gsd-dev-preferences/SKILL.md location used by the writer after #2973.
+ *
+ * Skips silently if no legacy file was preserved, or if a SKILL.md already
+ * exists at the new location (don't clobber user-customized skill content
+ * — they may have edited the new file directly). Returns true on actual
+ * migration so callers can log a one-line confirmation.
+ *
+ * @param {string} targetDir - Resolved runtime config directory (e.g. ~/.claude)
+ * @param {Map<string, string>} saved - Map returned by preserveUserArtifacts
+ * @returns {boolean} - true if a file was migrated, false otherwise
+ */
+function migrateLegacyDevPreferencesToSkill(targetDir, saved) {
+  if (!saved || !saved.has('dev-preferences.md')) return false;
+  const skillDir = path.join(targetDir, 'skills', 'gsd-dev-preferences');
+  const skillFile = path.join(skillDir, 'SKILL.md');
+  if (fs.existsSync(skillFile)) return false;
+  try {
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(skillFile, saved.get('dev-preferences.md'), 'utf8');
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -6038,7 +6190,14 @@ function uninstall(isGlobal, runtime = 'claude') {
       fs.rmSync(legacyCommandsDir, { recursive: true });
       removedCount++;
       console.log(`  ${green}✓${reset} Removed legacy commands/gsd/`);
+      // #2973: also migrate dev-preferences.md content into the new
+      // skills/gsd-dev-preferences/SKILL.md location (skills-aware runtimes).
+      // This prevents the legacy file from being orphaned after the writer
+      // starts targeting the skills path. No-op if SKILL.md already exists.
       restoreUserArtifacts(legacyCommandsDir, savedLegacyArtifacts);
+      if (migrateLegacyDevPreferencesToSkill(targetDir, savedLegacyArtifacts)) {
+        console.log(`  ${green}✓${reset} Migrated dev-preferences.md → skills/gsd-dev-preferences/SKILL.md (#2973)`);
+      }
     }
   } else if (isHermes) {
     // Hermes Agent: skills live under skills/gsd/ as a single category (per
@@ -6076,7 +6235,14 @@ function uninstall(isGlobal, runtime = 'claude') {
       fs.rmSync(legacyCommandsDir, { recursive: true });
       removedCount++;
       console.log(`  ${green}✓${reset} Removed legacy commands/gsd/`);
+      // #2973: also migrate dev-preferences.md content into the new
+      // skills/gsd-dev-preferences/SKILL.md location (skills-aware runtimes).
+      // This prevents the legacy file from being orphaned after the writer
+      // starts targeting the skills path. No-op if SKILL.md already exists.
       restoreUserArtifacts(legacyCommandsDir, savedLegacyArtifacts);
+      if (migrateLegacyDevPreferencesToSkill(targetDir, savedLegacyArtifacts)) {
+        console.log(`  ${green}✓${reset} Migrated dev-preferences.md → skills/gsd-dev-preferences/SKILL.md (#2973)`);
+      }
     }
   } else if (isGemini) {
     // Gemini: still uses commands/gsd/
@@ -7216,7 +7382,14 @@ function install(isGlobal, runtime = 'claude') {
       const savedLegacyArtifacts = preserveUserArtifacts(legacyCommandsDir, ['dev-preferences.md']);
       fs.rmSync(legacyCommandsDir, { recursive: true });
       console.log(`  ${green}✓${reset} Removed legacy commands/gsd/ directory`);
+      // #2973: also migrate dev-preferences.md content into the new
+      // skills/gsd-dev-preferences/SKILL.md location (skills-aware runtimes).
+      // This prevents the legacy file from being orphaned after the writer
+      // starts targeting the skills path. No-op if SKILL.md already exists.
       restoreUserArtifacts(legacyCommandsDir, savedLegacyArtifacts);
+      if (migrateLegacyDevPreferencesToSkill(targetDir, savedLegacyArtifacts)) {
+        console.log(`  ${green}✓${reset} Migrated dev-preferences.md → skills/gsd-dev-preferences/SKILL.md (#2973)`);
+      }
     }
   } else if (isHermes) {
     // Hermes Agent: nests all GSD skills under skills/gsd/ as a single
@@ -7258,7 +7431,14 @@ function install(isGlobal, runtime = 'claude') {
       const savedLegacyArtifacts = preserveUserArtifacts(legacyCommandsDir, ['dev-preferences.md']);
       fs.rmSync(legacyCommandsDir, { recursive: true });
       console.log(`  ${green}✓${reset} Removed legacy commands/gsd/ directory`);
+      // #2973: also migrate dev-preferences.md content into the new
+      // skills/gsd-dev-preferences/SKILL.md location (skills-aware runtimes).
+      // This prevents the legacy file from being orphaned after the writer
+      // starts targeting the skills path. No-op if SKILL.md already exists.
       restoreUserArtifacts(legacyCommandsDir, savedLegacyArtifacts);
+      if (migrateLegacyDevPreferencesToSkill(targetDir, savedLegacyArtifacts)) {
+        console.log(`  ${green}✓${reset} Migrated dev-preferences.md → skills/gsd-dev-preferences/SKILL.md (#2973)`);
+      }
     }
   } else if (isCodebuddy) {
     const skillsDir = path.join(targetDir, 'skills');
@@ -7309,7 +7489,14 @@ function install(isGlobal, runtime = 'claude') {
       const savedLegacyArtifacts = preserveUserArtifacts(legacyCommandsDir, ['dev-preferences.md']);
       fs.rmSync(legacyCommandsDir, { recursive: true });
       console.log(`  ${green}✓${reset} Removed legacy commands/gsd/ directory`);
+      // #2973: also migrate dev-preferences.md content into the new
+      // skills/gsd-dev-preferences/SKILL.md location (skills-aware runtimes).
+      // This prevents the legacy file from being orphaned after the writer
+      // starts targeting the skills path. No-op if SKILL.md already exists.
       restoreUserArtifacts(legacyCommandsDir, savedLegacyArtifacts);
+      if (migrateLegacyDevPreferencesToSkill(targetDir, savedLegacyArtifacts)) {
+        console.log(`  ${green}✓${reset} Migrated dev-preferences.md → skills/gsd-dev-preferences/SKILL.md (#2973)`);
+      }
     }
   } else {
     // Claude Code local: commands/gsd/ format — Claude Code reads local project
@@ -7875,6 +8062,14 @@ function install(isGlobal, runtime = 'claude') {
     return;
   }
   const settings = validateHookFields(cleanupOrphanedHooks(rawSettings));
+  // #3002 CR: rewrite legacy `node .../gsd-*.js` command strings carried over
+  // from pre-#2979 installs to use the absolute node binary path. Without this,
+  // existing managed hook entries stay bare-`node`-prefixed across reinstalls
+  // and remain broken under GUI/minimal-PATH runtimes.
+  const settingsRunner = resolveNodeRunner();
+  if (settingsRunner && rewriteLegacyManagedNodeHookCommands(settings, settingsRunner)) {
+    console.log(`  ${green}✓${reset} Rewrote legacy bare-node managed-hook commands to absolute path (#2979)`);
+  }
   // Local installs anchor hook paths so they resolve regardless of cwd (#1906).
   // Claude Code sets $CLAUDE_PROJECT_DIR; Gemini/Antigravity do not — and on
   // Windows their own substitution logic doubles the path (#2557). Those runtimes
@@ -7883,24 +8078,50 @@ function install(isGlobal, runtime = 'claude') {
     ? dirName
     : '"$CLAUDE_PROJECT_DIR"/' + dirName;
   const hookOpts = { portableHooks: hasPortableHooks };
+  // #2979: local-install hook commands also use the absolute node path so
+  // GUI/minimal-PATH runtimes can resolve them. Bare `node` fails when the
+  // host launches the runtime with a stripped PATH (Finder/Antigravity/etc).
+  const localNodeRunner = resolveNodeRunner();
+  // If we cannot resolve an absolute node path AND this is a local install,
+  // skip managed-hook registration. Returning null from buildHookCommand on
+  // global installs has the same effect. Better to skip than to emit a bare
+  // `node` command that recreates the #2979 failure.
+  const localCmd = (hookFile) => localNodeRunner === null
+    ? null
+    : localNodeRunner + ' ' + localPrefix + '/hooks/' + hookFile;
   const statuslineCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-statusline.js', hookOpts)
-    : 'node ' + localPrefix + '/hooks/gsd-statusline.js';
+    : localCmd('gsd-statusline.js');
   const updateCheckCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-check-update.js', hookOpts)
-    : 'node ' + localPrefix + '/hooks/gsd-check-update.js';
+    : localCmd('gsd-check-update.js');
   const contextMonitorCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-context-monitor.js', hookOpts)
-    : 'node ' + localPrefix + '/hooks/gsd-context-monitor.js';
+    : localCmd('gsd-context-monitor.js');
   const promptGuardCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-prompt-guard.js', hookOpts)
-    : 'node ' + localPrefix + '/hooks/gsd-prompt-guard.js';
+    : localCmd('gsd-prompt-guard.js');
   const readGuardCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-read-guard.js', hookOpts)
-    : 'node ' + localPrefix + '/hooks/gsd-read-guard.js';
+    : localCmd('gsd-read-guard.js');
   const readInjectionScannerCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-read-injection-scanner.js', hookOpts)
-    : 'node ' + localPrefix + '/hooks/gsd-read-injection-scanner.js';
+    : localCmd('gsd-read-injection-scanner.js');
+
+  // #3002 CR: when resolveNodeRunner() returns null, every dependent JS-hook
+  // command is null too. Emit one warning here so the operator sees the cause
+  // ONCE instead of per-hook. Each registration site below also guards on its
+  // own *Command variable being truthy, so we never write `command: null`
+  // entries to settings.json (which the runtime's hook schema would reject).
+  const anyJsHookCommandNull = !statuslineCommand
+    || !updateCheckCommand
+    || !contextMonitorCommand
+    || !promptGuardCommand
+    || !readGuardCommand
+    || !readInjectionScannerCommand;
+  if (anyJsHookCommandNull) {
+    console.warn(`  ${yellow}⚠${reset}  Skipping managed JS hook registration — Node executable path unavailable (process.execPath is empty). See #2979 / #3002.`);
+  }
 
   // Enable experimental agents for Gemini CLI (required for custom sub-agents)
   if (isGemini) {
@@ -7931,7 +8152,7 @@ function install(isGlobal, runtime = 'claude') {
     // copy step produces no files but the registration step ran unconditionally,
     // causing "hook error" on every tool invocation.
     const checkUpdateFile = path.join(targetDir, 'hooks', 'gsd-check-update.js');
-    if (!hasGsdUpdateHook && fs.existsSync(checkUpdateFile)) {
+    if (!hasGsdUpdateHook && fs.existsSync(checkUpdateFile) && updateCheckCommand) {
       settings.hooks.SessionStart.push({
         hooks: [
           {
@@ -7955,7 +8176,7 @@ function install(isGlobal, runtime = 'claude') {
     );
 
     const contextMonitorFile = path.join(targetDir, 'hooks', 'gsd-context-monitor.js');
-    if (!hasContextMonitorHook && fs.existsSync(contextMonitorFile)) {
+    if (!hasContextMonitorHook && fs.existsSync(contextMonitorFile) && contextMonitorCommand) {
       settings.hooks[postToolEvent].push({
         matcher: 'Bash|Edit|Write|MultiEdit|Agent|Task',
         hooks: [
@@ -8003,7 +8224,7 @@ function install(isGlobal, runtime = 'claude') {
     );
 
     const promptGuardFile = path.join(targetDir, 'hooks', 'gsd-prompt-guard.js');
-    if (!hasPromptGuardHook && fs.existsSync(promptGuardFile)) {
+    if (!hasPromptGuardHook && fs.existsSync(promptGuardFile) && promptGuardCommand) {
       settings.hooks[preToolEvent].push({
         matcher: 'Write|Edit',
         hooks: [
@@ -8027,7 +8248,7 @@ function install(isGlobal, runtime = 'claude') {
     );
 
     const readGuardFile = path.join(targetDir, 'hooks', 'gsd-read-guard.js');
-    if (!hasReadGuardHook && fs.existsSync(readGuardFile)) {
+    if (!hasReadGuardHook && fs.existsSync(readGuardFile) && readGuardCommand) {
       settings.hooks[preToolEvent].push({
         matcher: 'Write|Edit',
         hooks: [
@@ -8051,7 +8272,7 @@ function install(isGlobal, runtime = 'claude') {
     );
 
     const readInjectionScannerFile = path.join(targetDir, 'hooks', 'gsd-read-injection-scanner.js');
-    if (!hasReadInjectionScannerHook && fs.existsSync(readInjectionScannerFile)) {
+    if (!hasReadInjectionScannerHook && fs.existsSync(readInjectionScannerFile) && readInjectionScannerCommand) {
       settings.hooks[postToolEvent].push({
         matcher: 'Read',
         hooks: [
@@ -8077,13 +8298,13 @@ function install(isGlobal, runtime = 'claude') {
     // /gsd-quick or /gsd-fast for state-tracked changes. Advisory only.
     const workflowGuardCommand = isGlobal
       ? buildHookCommand(targetDir, 'gsd-workflow-guard.js', hookOpts)
-      : 'node ' + localPrefix + '/hooks/gsd-workflow-guard.js';
+      : localCmd('gsd-workflow-guard.js');
     const hasWorkflowGuardHook = settings.hooks[preToolEvent].some(entry =>
       entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-workflow-guard'))
     );
 
     const workflowGuardFile = path.join(targetDir, 'hooks', 'gsd-workflow-guard.js');
-    if (!hasWorkflowGuardHook && fs.existsSync(workflowGuardFile)) {
+    if (!hasWorkflowGuardHook && fs.existsSync(workflowGuardFile) && workflowGuardCommand) {
       settings.hooks[preToolEvent].push({
         matcher: 'Write|Edit',
         hooks: [
@@ -8196,6 +8417,11 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
       // any profile-level statusLine the user has configured (#2248).
       // Pass --force-statusline to override this guard.
       console.log(`  ${yellow}⚠${reset} Skipping statusLine for local install (avoids overriding profile-level settings; use --force-statusline to override)`);
+    } else if (!statuslineCommand) {
+      // #3002 CR: don't write { type: 'command', command: null } — the
+      // runtime's settings schema rejects null commands and the failure
+      // surfaces as a confusing parse error rather than a usable diagnostic.
+      console.warn(`  ${yellow}⚠${reset}  Skipped statusline registration — Node executable path unavailable (process.execPath is empty). See #2979 / #3002.`);
     } else {
       settings.statusLine = {
         type: 'command',
@@ -8205,9 +8431,15 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
     }
   }
 
-  // Write settings when runtime supports settings.json
+  // Write settings when runtime supports settings.json.
+  // #3002 CR: defense-in-depth — re-run validateHookFields right before
+  // serialization. The push-site guards above already skip null-command
+  // entries, but a future regression that bypasses them would still produce
+  // {type: 'command', command: null} items that the runtime hook schema
+  // rejects at parse time. validateHookFields filters those out so the file
+  // we write is always schema-valid.
   if (!isCodex && !isCopilot && !isKilo && !isCursor && !isWindsurf && !isTrae && !isCline) {
-    writeSettings(settingsPath, settings);
+    writeSettings(settingsPath, validateHookFields(settings));
   }
 
   // Configure OpenCode permissions
@@ -9191,6 +9423,7 @@ if (process.env.GSD_TEST_MODE) {
     validateHookFields,
     preserveUserArtifacts,
     restoreUserArtifacts,
+    migrateLegacyDevPreferencesToSkill,
     populatePristineDir,
     USER_OWNED_ARTIFACTS,
     finishInstall,
@@ -9204,6 +9437,9 @@ if (process.env.GSD_TEST_MODE) {
     allRuntimes,
     parseRuntimeInput,
     buildRuntimePromptText,
+    buildHookCommand,
+    resolveNodeRunner,
+    rewriteLegacyManagedNodeHookCommands,
   };
 } else {
 

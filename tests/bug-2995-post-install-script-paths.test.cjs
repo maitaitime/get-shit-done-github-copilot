@@ -179,9 +179,9 @@ describe('Bug #2995: real workflow audit', () => {
   // Known existing gaps tracked in their own issues. Removing an entry should
   // land in the same PR that fixes the underlying issue; CI surfaces any NEW
   // gap as a hard failure.
-  const KNOWN_GAPS = new Set([
-    'reapply-patches.md|scripts/verify-reapply-patches.cjs|not_installed',  // tracked in #2994
-  ]);
+  // (#2994 entry removed: this PR moves verify-reapply-patches.cjs to
+  // get-shit-done/bin/ which IS an installed prefix, closing the gap.)
+  const KNOWN_GAPS = new Set();
 
   test('no NEW workflow refs fail to resolve at the deployed path (KNOWN_GAPS allow-listed)', () => {
     const r = auditWorkflowScriptPaths({
