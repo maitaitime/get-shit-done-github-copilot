@@ -1,4 +1,5 @@
 import { formatQueryRawOutput } from './query-raw-output-projection.js';
+import { timeoutMessage } from './query-failure-classification.js';
 import type { QueryResult } from './query/utils.js';
 
 export interface QueryNativeDirectAdapterDeps {
@@ -33,7 +34,7 @@ export class QueryNativeDirectAdapter {
       timeoutId = setTimeout(() => {
         reject(
           this.deps.createTimeoutError(
-            `gsd-tools timed out after ${this.deps.timeoutMs}ms: ${legacyCommand} ${legacyArgs.join(' ')}`,
+            timeoutMessage(legacyCommand, legacyArgs, this.deps.timeoutMs),
             legacyCommand,
             legacyArgs,
           ),

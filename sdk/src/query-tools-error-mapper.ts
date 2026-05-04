@@ -1,5 +1,6 @@
 import { GSDError, exitCodeFor } from './errors.js';
 import { GSDToolsError } from './gsd-tools-error.js';
+import { errorMessage } from './query-failure-classification.js';
 
 /**
  * Module owning projection of internal errors to GSDToolsError contract.
@@ -16,7 +17,7 @@ export function toGSDToolsError(command: string, args: string[], err: unknown): 
     );
   }
 
-  const msg = err instanceof Error ? err.message : String(err);
+  const msg = errorMessage(err);
   return new GSDToolsError(
     msg,
     command,

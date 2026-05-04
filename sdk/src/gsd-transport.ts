@@ -1,6 +1,7 @@
 import type { QueryResult } from './query/utils.js';
 import type { QueryRegistry } from './query/registry.js';
 import type { TransportMode } from './gsd-transport-policy.js';
+import { isTimeoutLikeError } from './query-failure-classification.js';
 
 export interface TransportRequest {
   legacyCommand: string;
@@ -22,12 +23,6 @@ export interface TransportAdapters {
 export interface TransportPolicyLike {
   preferNative: boolean;
   allowFallbackToSubprocess: boolean;
-}
-
-function isTimeoutLikeError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  if (error.name === 'TimeoutError' || error.name === 'AbortError') return true;
-  return error.message.includes('timed out after');
 }
 
 export class GSDTransport {

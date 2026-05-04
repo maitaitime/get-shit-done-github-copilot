@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { timeoutMessage } from './query-failure-classification.js';
 import type { GSDToolsError } from './gsd-tools-error.js';
 
 export interface QuerySubprocessAdapterDeps {
@@ -40,7 +41,7 @@ export class QuerySubprocessAdapter {
             if (error.killed || (error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
               reject(
                 this.deps.createToolsError(
-                  `gsd-tools timed out after ${this.deps.timeoutMs}ms: ${command} ${args.join(' ')}`,
+                  timeoutMessage(command, args, this.deps.timeoutMs),
                   command,
                   args,
                   null,
@@ -106,7 +107,7 @@ export class QuerySubprocessAdapter {
             if (error.killed || (error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
               reject(
                 this.deps.createToolsError(
-                  `gsd-tools timed out after ${this.deps.timeoutMs}ms: ${command} ${args.join(' ')}`,
+                  timeoutMessage(command, args, this.deps.timeoutMs),
                   command,
                   args,
                   null,
