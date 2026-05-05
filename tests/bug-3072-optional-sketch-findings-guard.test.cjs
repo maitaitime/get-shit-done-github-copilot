@@ -11,6 +11,37 @@ function read(rel) {
   return fs.readFileSync(path.join(ROOT, rel), 'utf8');
 }
 
+function extractFindingsProbesFromBashBlocks(markdown) {
+  const probes = [];
+  const fenceRe = /```bash\n([\s\S]*?)```/g;
+  let fenceMatch;
+
+  while ((fenceMatch = fenceRe.exec(markdown)) !== null) {
+    const block = fenceMatch[1];
+    const baseLine = markdown.slice(0, fenceMatch.index).split('\n').length;
+    const lines = block.split('\n');
+
+    lines.forEach((line, idx) => {
+      if (!line.includes('.claude/skills/')) return;
+      const kind = line.includes('sketch-findings-*/SKILL.md')
+        ? 'sketch'
+        : line.includes('spike-findings-*/SKILL.md')
+          ? 'spike'
+          : null;
+      if (!kind) return;
+
+      probes.push({
+        lineNumber: baseLine + idx,
+        commandText: line.trim(),
+        kind,
+        hasNonFatalGuard: /\|\|\s*true/.test(line),
+      });
+    });
+  }
+
+  return probes;
+}
+
 describe('bug #3072: optional sketch/spike findings probes are non-fatal', () => {
   test('all sketch/spike findings SKILL.md ls probes include || true', () => {
     const files = ['ui-phase.md', 'plan-phase.md', 'discuss-phase.md', 'new-project.md'];
@@ -18,10 +49,10 @@ describe('bug #3072: optional sketch/spike findings probes are non-fatal', () =>
 
     for (const file of files) {
       const content = read(file);
-      const lines = content.split('\n');
-      for (const line of lines) {
-        if (/\.claude\/skills\/(?:sketch|spike)-findings-\*\/SKILL\.md/.test(line) && !/\|\|\s*true/.test(line)) {
-          offenders.push(`${file}: ${line.trim()}`);
+      const probes = extractFindingsProbesFromBashBlocks(content);
+      for (const probe of probes) {
+        if (!probe.hasNonFatalGuard) {
+          offenders.push(`${file}:${probe.lineNumber} ${probe.commandText}`);
         }
       }
     }
