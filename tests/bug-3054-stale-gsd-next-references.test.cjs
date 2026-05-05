@@ -15,6 +15,16 @@ function walkMd(dir, out = []) {
   return out;
 }
 
+function extractSlashCommandTokens(markdown) {
+  const tokenRe = /\/gsd-[a-z0-9-]+/gi;
+  const tokens = new Set();
+  let m;
+  while ((m = tokenRe.exec(markdown)) !== null) {
+    tokens.add(m[0]);
+  }
+  return tokens;
+}
+
 describe('bug #3054: user-facing docs should not reference removed /gsd-next command', () => {
   test('docs, workflows, and README surfaces use /gsd-progress --next instead', () => {
     const root = path.join(__dirname, '..');
@@ -27,7 +37,8 @@ describe('bug #3054: user-facing docs should not reference removed /gsd-next com
     const offenders = [];
     for (const file of files) {
       const content = fs.readFileSync(file, 'utf8');
-      if (content.includes('/gsd-next')) offenders.push(path.relative(root, file));
+      const tokens = extractSlashCommandTokens(content);
+      if (tokens.has('/gsd-next')) offenders.push(path.relative(root, file));
     }
 
     assert.deepStrictEqual(offenders, [], `stale /gsd-next references remain in: ${offenders.join(', ')}`);

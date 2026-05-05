@@ -120,7 +120,7 @@
   - [Autonomous Audit-to-Fix](#98-autonomous-audit-to-fix)
   - [Improved Prompt Injection Scanner](#99-improved-prompt-injection-scanner)
   - [Stall Detection in Plan-Phase](#100-stall-detection-in-plan-phase)
-  - [Hard Stop Safety Gates in /gsd-progress --next](#101-hard-stop-safety-gates-in-gsd-next)
+  - [Hard Stop Safety Gates in /gsd-progress --next](#101-hard-stop-safety-gates-in-gsd-progress---next)
   - [Adaptive Model Preset](#102-adaptive-model-preset)
   - [Post-Merge Hunk Verification](#103-post-merge-hunk-verification)
 - [v1.35.0 Features](#v1350-features)
@@ -2023,7 +2023,7 @@ Test suite that scans all agent, workflow, and command files for embedded inject
   - [Autonomous Audit-to-Fix](#98-autonomous-audit-to-fix)
   - [Improved Prompt Injection Scanner](#99-improved-prompt-injection-scanner)
   - [Stall Detection in Plan-Phase](#100-stall-detection-in-plan-phase)
-  - [Hard Stop Safety Gates in /gsd-progress --next](#101-hard-stop-safety-gates-in-gsd-next)
+  - [Hard Stop Safety Gates in /gsd-progress --next](#101-hard-stop-safety-gates-in-gsd-progress---next)
   - [Adaptive Model Preset](#102-adaptive-model-preset)
   - [Post-Merge Hunk Verification](#103-post-merge-hunk-verification)
 
