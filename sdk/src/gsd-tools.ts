@@ -150,7 +150,10 @@ export class GSDTools {
    * Use for commands like `config-set` that return plain text, not JSON.
    */
   async execRaw(command: string, args: string[] = []): Promise<string> {
-    return this.executeWithToolsError(command, args, async () => this.commandExecutor.exec(command, args, 'raw') as string);
+    return this.executeWithToolsError(command, args, async () => {
+      const out = await this.commandExecutor.exec(command, args, 'raw');
+      return typeof out === 'string' ? out : String(out ?? '');
+    });
   }
 
 
