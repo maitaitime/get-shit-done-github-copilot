@@ -25,5 +25,41 @@ export class GSDToolsError extends Error {
     this.classification = options?.classification;
   }
 
+  static timeout(
+    message: string,
+    command: string,
+    args: string[],
+    stderr = '',
+    timeoutMs?: number,
+    options?: { cause?: unknown; exitCode?: number | null },
+  ): GSDToolsError {
+    return new GSDToolsError(
+      message,
+      command,
+      args,
+      options?.exitCode ?? null,
+      stderr,
+      { cause: options?.cause, classification: timeoutClassification(timeoutMs) },
+    );
+  }
+
+  static failure(
+    message: string,
+    command: string,
+    args: string[],
+    exitCode: number | null,
+    stderr = '',
+    options?: { cause?: unknown },
+  ): GSDToolsError {
+    return new GSDToolsError(
+      message,
+      command,
+      args,
+      exitCode,
+      stderr,
+      { cause: options?.cause, classification: failureClassification() },
+    );
+  }
+
   public readonly classification?: GSDToolsErrorClassification;
 }

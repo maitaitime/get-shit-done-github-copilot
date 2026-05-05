@@ -1,5 +1,5 @@
 import { GSDError, exitCodeFor } from './errors.js';
-import { failureClassification, GSDToolsError, timeoutClassification } from './gsd-tools-error.js';
+import { GSDToolsError } from './gsd-tools-error.js';
 import { errorMessage, toFailureSignal } from './query-failure-classification.js';
 
 /**
@@ -7,7 +7,7 @@ import { errorMessage, toFailureSignal } from './query-failure-classification.js
  */
 export function toGSDToolsError(command: string, args: string[], err: unknown): GSDToolsError {
   if (err instanceof GSDError) {
-    return new GSDToolsError(
+    return GSDToolsError.failure(
       err.message,
       command,
       args,
@@ -19,18 +19,9 @@ export function toGSDToolsError(command: string, args: string[], err: unknown): 
 
   const msg = errorMessage(err);
   const signal = toFailureSignal(err);
-  const classification = signal.kind === 'timeout'
-    ? timeoutClassification(signal.timeoutMs)
-    : failureClassification();
+  if (signal.kind === 'timeout') {
+    return GSDToolsError.timeout(msg, command, args, '', signal.timeoutMs, err instanceof Error ? { cause: err } : undefined);
+  }
 
-  return new GSDToolsError(
-    msg,
-    command,
-    args,
-    1,
-    '',
-    err instanceof Error
-      ? { cause: err, classification }
-      : { classification },
-  );
+  return GSDToolsError.failure(msg, command, args, 1, '', err instanceof Error ? { cause: err } : undefined);
 }
