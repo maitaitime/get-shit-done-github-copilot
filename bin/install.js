@@ -3336,13 +3336,10 @@ function migrateCodexHooksMapFormat(content) {
   // Use section.segments (parsed key count) rather than section.path.startsWith() so that
   // nested handler tables like [hooks.SessionStart.hooks] (3 segments) are not mistakenly
   // included and re-emitted as an event named "SessionStart.hooks".
-  // Exclude hooks.state and hooks.state.* — these are Codex's persistent hook-trust
-  // namespace (Codex CLI 0.130.0+) and use regular-table shape, never AoT.
   const legacyMapSections = sections.filter(
     (section) => !section.array && (
       section.path === 'hooks' ||
-      (section.path.startsWith('hooks.') && section.segments.length === 2 &&
-        section.path !== 'hooks.state' && !section.path.startsWith('hooks.state.'))
+      (section.path.startsWith('hooks.') && section.segments.length === 2)
     )
   );
 
@@ -3980,20 +3977,7 @@ function validateCodexConfigSchema(content) {
       };
     }
 
-    // hooks.state.* is Codex's persistent hook-trust namespace (added in
-    // Codex CLI 0.130.0). It uses regular-table shape, NOT array-of-tables.
-    // [[hooks.state]] or [[hooks.state.<key>]] (AoT) is invalid; reject it.
-    if (section.array && (section.path === 'hooks.state' || section.path.startsWith('hooks.state.'))) {
-      return {
-        ok: false,
-        reason: `[[${section.path}]] is invalid; hooks.state namespace must use regular tables`,
-      };
-    }
-
-    // All other hooks.* paths (event handlers like hooks.SessionStart) require
-    // AoT shape — bare [hooks.<Event>] (single-bracket) is invalid.
-    if (!section.array && section.path.startsWith('hooks.') &&
-        section.path !== 'hooks.state' && !section.path.startsWith('hooks.state.')) {
+    if (!section.array && section.path.startsWith('hooks.')) {
       return {
         ok: false,
         reason: `bare [${section.path}] table is invalid in current Codex schema (expected [[${section.path}]] array-of-tables)`,
@@ -4013,24 +3997,6 @@ function validateCodexConfigSchema(content) {
     }
     if (typeof parsed.hooks === 'object' && parsed.hooks !== null) {
       for (const [event, value] of Object.entries(parsed.hooks)) {
-        // hooks.state is Codex's persistent hook-trust namespace — a regular
-        // object (table), not an array of event-handler tables.
-        // Reject AoT shape (Array) and scalar forms; only plain objects are valid.
-        if (event === 'state') {
-          if (Array.isArray(value)) {
-            return {
-              ok: false,
-              reason: `hooks.state must be a regular table/object, got array-of-tables`,
-            };
-          }
-          if (typeof value !== 'object' || value === null) {
-            return {
-              ok: false,
-              reason: `hooks.state must be a regular table/object, got ${typeof value}`,
-            };
-          }
-          continue;
-        }
         // Skip the nested .hooks sub-array — it lives under hooks.<Event>[n].hooks
         // and is validated separately below.
         if (!Array.isArray(value)) {
@@ -7985,28 +7951,6 @@ function install(isGlobal, runtime = 'claude') {
     failures.push('get-shit-done');
   }
 
-  // #3288 — Copy sdk/shared/model-catalog.json into the get-shit-done payload
-  // at the co-located path that model-catalog.cjs resolves first:
-  //   get-shit-done/bin/shared/model-catalog.json
-  //
-  // The install copies get-shit-done/ but NOT sdk/ — the CJS module's legacy
-  // path (3 levels up → sdk/shared/) therefore resolves to a non-existent
-  // location in every post-install layout.  Copying the catalog alongside the
-  // CJS files ensures require() succeeds without needing sdk/ to exist.
-  const modelCatalogSrc = path.join(src, 'sdk', 'shared', 'model-catalog.json');
-  const modelCatalogDest = path.join(skillDest, 'bin', 'shared', 'model-catalog.json');
-  if (fs.existsSync(modelCatalogSrc)) {
-    fs.mkdirSync(path.dirname(modelCatalogDest), { recursive: true });
-    fs.copyFileSync(modelCatalogSrc, modelCatalogDest);
-    if (verifyFileInstalled(modelCatalogDest, 'get-shit-done/bin/shared/model-catalog.json')) {
-      console.log(`  ${green}✓${reset} Installed get-shit-done/bin/shared/model-catalog.json`);
-    } else {
-      failures.push('get-shit-done/bin/shared/model-catalog.json');
-    }
-  } else {
-    failures.push('sdk/shared/model-catalog.json (source missing)');
-  }
-
   // Copy agents to agents directory.
   // Skipped under --minimal: gsd-* subagent descriptions are eagerly loaded
   // into the runtime's Agent tool schema, costing ~6k tokens per turn even
@@ -9859,32 +9803,24 @@ function installSdkIfNeeded(opts) {
   // mismatch, POSIX ~/.local/bin missing from login shell, or node-
   // version-manager PATH shims. Probe the user's login shell PATH and
   // require the shim to be reachable there too before claiming ✓.
+  // POSIX-only probe; on Windows getUserShellPath() returns null and
+  // we trust the existing check (Windows-specific fix is separate).
   //
-  // #3211 (Windows): getUserShellWindowsPersistentPath() reads the user-level
-  // 'Path' registry key via PowerShell — the correct cross-shell source on
-  // Windows (Git Bash, PowerShell, and cmd.exe all inherit it). Returns null
-  // when PowerShell is unavailable or the probe times out.
-  //
-  // #3231: when getUserShellPath() / getUserShellWindowsPersistentPath()
-  // returns null (probe failed or unavailable), we cannot confirm persistent
-  // reachability. Since we already filtered npx dirs from persistentPath above,
-  // onPath=true means a non-transient dir has the shim — that is the best
-  // available invariant and is sufficient to claim ✓.
-  const userShellPath = process.platform === 'win32'
-    ? getUserShellWindowsPersistentPath()
-    : getUserShellPath();
+  // #3231: when getUserShellPath() returns null (e.g. $SHELL unset on
+  // Linux, rc-file timeout), we cannot confirm persistent reachability.
+  // In that case, do NOT preserve a true onPath — require the initial
+  // check (on persistentPath) to have found the shim in a persistent
+  // location. Since we already filtered npx dirs above, onPath=true here
+  // means a non-transient dir has the shim, which is sufficient.
+  const userShellPath = getUserShellPath();
   if (onPath && userShellPath !== null) {
-    // filterNpxFromPath is applied inside getUserShellWindowsPersistentPath
-    // (Windows) and here for the POSIX case.
-    const persistentUserShellPath = process.platform === 'win32'
-      ? userShellPath  // already filtered by getUserShellWindowsPersistentPath
-      : filterNpxFromPath(userShellPath);
+    const persistentUserShellPath = filterNpxFromPath(userShellPath);
     const userSees = isGsdSdkOnPath(persistentUserShellPath);
     if (!userSees) {
       onPath = false;
     }
   }
-  // If userShellPath is null (probe failed or unavailable), onPath reflects
+  // If userShellPath is null (POSIX probe failed), onPath reflects
   // the persistent-PATH check — that is the best available invariant.
 
   if (onPath) {
@@ -10059,8 +9995,9 @@ function isGsdSdkOnPath(pathString) {
  * login shell.
  *
  * Uses `$SHELL -lc 'printf %s "$PATH"'` on POSIX. Returns null on Windows
- * (the Windows counterpart is getUserShellWindowsPersistentPath, which reads
- * the user-level 'Path' registry key via PowerShell). Returns null
+ * (cross-shell PATH probing requires a different strategy — Git Bash
+ * vs PowerShell vs cmd.exe each read PATH from different sources, and
+ * a future revision can build a Windows-aware probe). Returns null
  * when $SHELL is unset, when the spawn fails, or when the result is
  * empty — callers must fall back to process.env.PATH in those cases.
  *
@@ -10088,72 +10025,6 @@ function getUserShellPath() {
     const lines = String(out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
     const candidate = lines.length > 0 ? lines[lines.length - 1] : '';
     return candidate.length > 0 ? candidate : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * #3211: Windows counterpart to getUserShellPath(). Probes the effective
- * persistent Path from the Windows registry via PowerShell by merging
- * Machine-level + User-level entries:
- *
- *   $m=[Environment]::GetEnvironmentVariable('Path','Machine')
- *   $u=[Environment]::GetEnvironmentVariable('Path','User')
- *   ($m + ';' + $u).Trim(';')
- *
- * This is the correct primitive for Windows cross-shell PATH verification —
- * Git Bash, PowerShell, and cmd.exe all inherit the effective (Machine;User)
- * registry Path, while the install-subprocess process.env.PATH is polluted
- * with transient npx entries and may not include directories added by the
- * user post-install. Reading only User-level Path would produce a false
- * warning when gsd-sdk is in a machine-level bin dir (e.g. C:\Program Files\nodejs).
- *
- * Returns the filtered persistent Path string (npx segments stripped) or null
- * on any failure (non-Windows, PowerShell not available, spawn timeout, empty
- * result). Callers must treat null as "check unavailable — trust install-time
- * filtered PATH".
- *
- * Synchronous, 2-second timeout, best-effort — safe to call from
- * installSdkIfNeeded without restructuring to async.
- */
-function getUserShellWindowsPersistentPath() {
-  if (process.platform !== 'win32') return null;
-  const cp = require('child_process');
-  // Use the same execFileSync form as getUserShellPath() above — static
-  // literal args, no user input, no injection vector.
-  const execFile = cp.execFileSync.bind(cp);
-  try {
-    // Read Machine + User Path and merge them — the effective PATH that
-    // PowerShell, cmd.exe, and Git Bash inherit is Machine;User (machine
-    // entries first). Reading only User-level Path would produce a false
-    // warning when gsd-sdk is installed in a machine-level bin dir
-    // (e.g. C:\Program Files\nodejs).
-    const out = execFile(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-Command',
-        "$u=[Environment]::GetEnvironmentVariable('Path','User');" +
-        "$m=[Environment]::GetEnvironmentVariable('Path','Machine');" +
-        "[Console]::Out.Write(($m + ';' + $u).Trim(';'))",
-      ],
-      {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        // 2-second cap — a locked registry or slow profile can't hang the install.
-        timeout: 2000,
-      },
-    );
-    // Take the last non-empty line so any motd/banner noise before the output
-    // doesn't corrupt the result — same defensive pattern as getUserShellPath.
-    const lines = String(out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    const candidate = lines.length > 0 ? lines[lines.length - 1] : '';
-    if (!candidate) return null;
-    // Strip transient npx dirs from the persistent Path before returning —
-    // the registry can accumulate stale _npx entries from prior runs.
-    const filtered = filterNpxFromPath(candidate);
-    return filtered.length > 0 ? filtered : null;
   } catch {
     return null;
   }
@@ -10597,7 +10468,6 @@ if (process.env.GSD_TEST_MODE) {
     isLegacyGsdSdkShim,
     isGsdSdkOnPath,
     getUserShellPath,
-    getUserShellWindowsPersistentPath,
     homePathCoveredByRc,
     maybeSuggestPathExport,
     runtimeMap,
