@@ -76,6 +76,14 @@ const {
   isMinimalMode,
   stageSkillsForMode,
 } = require(path.join(_gsdLibDir, 'install-profiles.cjs'));
+const {
+  discoverInstallerMigrations,
+  runInstallerMigrations,
+} = require(path.join(_gsdLibDir, 'installer-migrations.cjs'));
+const {
+  assertInstallerMigrationsUnblocked,
+  summarizeInstallerMigrationResult,
+} = require(path.join(_gsdLibDir, 'installer-migration-report.cjs'));
 
 // Parse args
 const args = process.argv.slice(2);
@@ -599,6 +607,35 @@ function formatHookCommandForShell(command, opts) {
   return platform === 'win32' ? `& ${command}` : command;
 }
 
+function formatManagedHookScriptToken(scriptPath, opts) {
+  const platform = (opts && opts.platform) || process.platform;
+  if (platform !== 'win32') return null;
+  return JSON.stringify(scriptPath.replace(/\\/g, '/'));
+}
+
+function resolveBashRunner(opts) {
+  const platform = (opts && opts.platform) || process.platform;
+  if (platform !== 'win32') return 'bash';
+
+  const env = (opts && opts.env) || process.env;
+  const exists = (opts && opts.existsSync) || fs.existsSync;
+  const candidates = [];
+  if (env.GSD_BASH_PATH) candidates.push(env.GSD_BASH_PATH);
+  if (env.ProgramFiles) candidates.push(path.win32.join(env.ProgramFiles, 'Git', 'bin', 'bash.exe'));
+  if (env['ProgramFiles(x86)']) candidates.push(path.win32.join(env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe'));
+  if (env.SystemDrive) {
+    candidates.push(path.win32.join(env.SystemDrive, 'Program Files', 'Git', 'bin', 'bash.exe'));
+    candidates.push(path.win32.join(env.SystemDrive, 'Program Files (x86)', 'Git', 'bin', 'bash.exe'));
+  }
+
+  for (const candidate of candidates) {
+    if (candidate && exists(candidate)) {
+      return JSON.stringify(candidate.replace(/\\/g, '/'));
+    }
+  }
+  return null;
+}
+
 function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts) {
   if (!settings || !settings.hooks || !absoluteRunner) return false;
   if (!opts) opts = {};
@@ -672,7 +709,8 @@ function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts) {
           if (platform !== 'win32' || hadPowerShellCallOperator) continue;
         }
 
-        h.command = formatHookCommandForShell(`${absoluteRunner} ${scriptToken}`, opts);
+        const safeScriptToken = formatManagedHookScriptToken(scriptPath, opts) || scriptToken;
+        h.command = formatHookCommandForShell(`${absoluteRunner} ${safeScriptToken}`, opts);
         changed = true;
       }
     }
@@ -774,76 +812,6 @@ function rewriteLegacyCodexHookBlock(content, absoluteRunner) {
   return { content: updated, changed };
 }
 
-function isManagedCodexHookCommand(command, targetDir) {
-  if (typeof command !== 'string') return false;
-  if (typeof targetDir !== 'string' || targetDir.length === 0) return false;
-  const normalizedCommand = command.replace(/\\/g, '/');
-  const managedHooksDir = `${path.join(targetDir, 'hooks').replace(/\\/g, '/')}/`;
-  if (!normalizedCommand.includes(managedHooksDir)) return false;
-  return /(^|[\\/\s"'])(gsd-check-update\.js|gsd-update-check\.js)(?=$|[\s"'])/.test(normalizedCommand);
-}
-
-function pruneGsdManagedHooksJsonValue(value, targetDir) {
-  if (Array.isArray(value)) {
-    let changed = false;
-    const next = [];
-    for (const item of value) {
-      const pruned = pruneGsdManagedHooksJsonValue(item, targetDir);
-      if (pruned.changed) changed = true;
-      if (!isStructurallyEmpty(pruned.value)) next.push(pruned.value);
-      else changed = true;
-    }
-    return { value: next, changed };
-  }
-
-  if (value && typeof value === 'object') {
-    if (isManagedCodexHookCommand(value.command, targetDir)) {
-      return { value: null, changed: true };
-    }
-
-    let changed = false;
-    const next = {};
-    for (const [key, child] of Object.entries(value)) {
-      const pruned = pruneGsdManagedHooksJsonValue(child, targetDir);
-      if (pruned.changed) changed = true;
-      if (!isStructurallyEmpty(pruned.value)) next[key] = pruned.value;
-      else changed = true;
-    }
-    return { value: next, changed };
-  }
-
-  return { value, changed: false };
-}
-
-function isStructurallyEmpty(value) {
-  if (value === null || value === undefined) return true;
-  if (Array.isArray(value)) return value.length === 0;
-  return typeof value === 'object' && Object.keys(value).length === 0;
-}
-
-function cleanupLegacyCodexHooksJson(targetDir) {
-  const hooksPath = path.join(targetDir, 'hooks.json');
-  if (!fs.existsSync(hooksPath)) return { changed: false, removedFile: false };
-
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
-  } catch {
-    return { changed: false, removedFile: false, skipped: 'invalid_json' };
-  }
-
-  const pruned = pruneGsdManagedHooksJsonValue(parsed, targetDir);
-  if (!pruned.changed) return { changed: false, removedFile: false };
-
-  if (isStructurallyEmpty(pruned.value)) {
-    fs.unlinkSync(hooksPath);
-    return { changed: true, removedFile: true };
-  }
-
-  atomicWriteFileSync(hooksPath, JSON.stringify(pruned.value, null, 2) + '\n', 'utf8');
-  return { changed: true, removedFile: false };
-}
-
 /**
  * Build a hook command path using forward slashes for cross-platform compatibility.
  * On Windows, $HOME is not expanded by cmd.exe/PowerShell, so we use the actual path.
@@ -858,21 +826,19 @@ function cleanupLegacyCodexHooksJson(targetDir) {
  */
 function buildHookCommand(configDir, hookName, opts) {
   if (!opts) opts = {};
-  // .sh hooks run under bare `bash` (PATH-resolved). POSIX guarantees
-  // /bin/sh but not /bin/bash, and distros like NixOS do not ship
-  // /bin/bash by default — so PATH-resolved `bash` is more portable than
-  // an absolute /bin/bash. The wrapping `bash <path>` invocation also
-  // means the script's own shebang (#!/usr/bin/env bash) is read as a
-  // comment in this code path; it only matters when the script is run
-  // directly (e.g. tests or future installer changes). .js hooks still
-  // need the absolute node path because GUI-launched runtimes start with
-  // a minimal PATH that does not include nvm/Homebrew/Volta-installed
-  // node binaries (#2979).
+  // POSIX .sh hooks run under PATH-resolved `bash`: POSIX guarantees /bin/sh
+  // but not /bin/bash, and distros like NixOS do not ship /bin/bash by default.
+  // Windows Codex launches hooks from PowerShell/cmd environments where bare
+  // `bash` may not be on PATH, so resolve Git Bash explicitly or return null so
+  // callers skip registration instead of installing a known-broken hook (#3393).
+  // .js hooks still need the absolute node path because GUI-launched runtimes
+  // start with a minimal PATH that may not include nvm/Homebrew/Volta node
+  // binaries (#2979).
   const nodeRunner = resolveNodeRunner();
-  const runner = hookName.endsWith('.sh') ? 'bash' : nodeRunner;
-  // resolveNodeRunner returns null when process.execPath is unavailable.
+  const runner = hookName.endsWith('.sh') ? resolveBashRunner(opts) : nodeRunner;
+  // Runner resolvers return null when the executable path is unavailable.
   // Fall through with null so callers can skip registration with a warning
-  // instead of emitting bare `node` (which would recreate the #2979 bug).
+  // instead of emitting a command that recreates the original hook failure.
   if (runner === null) return null;
 
   if (opts.portableHooks) {
@@ -6174,24 +6140,6 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand
 }
 
 /**
- * Clean up orphaned files from previous GSD versions
- */
-function cleanupOrphanedFiles(configDir) {
-  const orphanedFiles = [
-    'hooks/gsd-notify.sh',  // Removed in v1.6.x
-    'hooks/statusline.js',  // Renamed to gsd-statusline.js in v1.9.0
-  ];
-
-  for (const relPath of orphanedFiles) {
-    const fullPath = path.join(configDir, relPath);
-    if (fs.existsSync(fullPath)) {
-      fs.unlinkSync(fullPath);
-      console.log(`  ${green}✓${reset} Removed orphaned ${relPath}`);
-    }
-  }
-}
-
-/**
  * Clean up orphaned hook registrations from settings.json
  */
 function cleanupOrphanedHooks(settings) {
@@ -7191,6 +7139,58 @@ function generateManifest(dir, baseDir) {
   return manifest;
 }
 
+function normalizeInstallRelativePath(relPath) {
+  if (typeof relPath !== 'string' || relPath.trim() === '' || relPath.includes('\0')) {
+    return null;
+  }
+  if (path.isAbsolute(relPath) || path.win32.isAbsolute(relPath)) {
+    return null;
+  }
+  const normalized = relPath.replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+    return null;
+  }
+  return segments.join('/');
+}
+
+function resolveInstallRelativePath(baseDir, relPath) {
+  const normalized = normalizeInstallRelativePath(relPath);
+  if (!normalized) return null;
+  const root = path.resolve(baseDir);
+  const fullPath = path.resolve(root, normalized);
+  if (fullPath !== root && !fullPath.startsWith(root + path.sep)) {
+    return null;
+  }
+  if (hasExistingSymlinkBetween(root, fullPath)) {
+    return null;
+  }
+  return { relPath: normalized, fullPath };
+}
+
+function hasExistingSymlinkBetween(root, fullPath) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedFullPath = path.resolve(fullPath);
+  if (resolvedFullPath !== resolvedRoot && !resolvedFullPath.startsWith(resolvedRoot + path.sep)) {
+    return true;
+  }
+
+  let cursor = resolvedRoot;
+  if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) {
+    return true;
+  }
+
+  const relative = path.relative(resolvedRoot, resolvedFullPath);
+  for (const segment of relative.split(path.sep)) {
+    if (!segment) continue;
+    cursor = path.join(cursor, segment);
+    if (!fs.existsSync(cursor)) return false;
+    if (fs.lstatSync(cursor).isSymbolicLink()) return true;
+  }
+
+  return false;
+}
+
 /**
  * Write file manifest after installation for future modification detection
  */
@@ -7333,8 +7333,11 @@ function populatePristineDir({ packageSrc, pristineDir, modified, runtime, pathP
   let written = 0;
   try {
     const topLevels = new Set();
+    const safeModified = [];
     for (const relPath of modified) {
-      const norm = relPath.replace(/\\/g, '/');
+      const norm = normalizeInstallRelativePath(relPath);
+      if (!norm) continue;
+      safeModified.push(norm);
       const slash = norm.indexOf('/');
       topLevels.add(slash === -1 ? '' : norm.slice(0, slash));
     }
@@ -7344,14 +7347,16 @@ function populatePristineDir({ packageSrc, pristineDir, modified, runtime, pathP
         // Root-level files — copy directly from package source. The transform
         // pipeline is directory-oriented; root files don't need path-prefix
         // substitution (they're not markdown content with embedded paths).
-        for (const relPath of modified) {
-          const norm = relPath.replace(/\\/g, '/');
+        for (const relPath of safeModified) {
+          const norm = normalizeInstallRelativePath(relPath);
+          if (!norm) continue;
           if (norm.includes('/')) continue;
-          const src = path.join(packageSrc, relPath);
-          if (!fs.existsSync(src)) continue;
-          const stagedFile = path.join(stageRoot, relPath);
+          const srcRef = resolveInstallRelativePath(packageSrc, norm);
+          const stagedRef = resolveInstallRelativePath(stageRoot, norm);
+          if (!srcRef || !stagedRef || !fs.existsSync(srcRef.fullPath)) continue;
+          const stagedFile = stagedRef.fullPath;
           fs.mkdirSync(path.dirname(stagedFile), { recursive: true });
-          fs.copyFileSync(src, stagedFile);
+          fs.copyFileSync(srcRef.fullPath, stagedFile);
         }
         continue;
       }
@@ -7361,15 +7366,15 @@ function populatePristineDir({ packageSrc, pristineDir, modified, runtime, pathP
       copyWithPathReplacement(srcDir, stageDir, pathPrefix, runtime, false, isGlobal);
     }
 
-    for (const relPath of modified) {
+    for (const relPath of safeModified) {
       // Only populate pristine for paths we successfully staged. If a path's
       // source dir does not exist (obsolete manifest entry), skip silently
       // rather than corrupting pristine with stale data.
-      const stagedPath = path.join(stageRoot, relPath);
-      if (!fs.existsSync(stagedPath)) continue;
-      const out = path.join(pristineDir, relPath);
-      fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.copyFileSync(stagedPath, out);
+      const stagedRef = resolveInstallRelativePath(stageRoot, relPath);
+      const outRef = resolveInstallRelativePath(pristineDir, relPath);
+      if (!stagedRef || !outRef || !fs.existsSync(stagedRef.fullPath)) continue;
+      fs.mkdirSync(path.dirname(outRef.fullPath), { recursive: true });
+      fs.copyFileSync(stagedRef.fullPath, outRef.fullPath);
       written++;
     }
   } finally {
@@ -7408,17 +7413,23 @@ function saveLocalPatches(configDir, pristineCtx) {
   const patchesDir = path.join(configDir, PATCHES_DIR_NAME);
   const pristineDir = path.join(configDir, 'gsd-pristine');
   const modified = [];
+  const pristineHashes = {};
 
   for (const [relPath, originalHash] of Object.entries(manifest.files || {})) {
-    const fullPath = path.join(configDir, relPath);
+    const safeRef = resolveInstallRelativePath(configDir, relPath);
+    if (!safeRef) continue;
+    const { relPath: safeRelPath, fullPath } = safeRef;
     if (!fs.existsSync(fullPath)) continue;
     const currentHash = fileHash(fullPath);
     if (currentHash !== originalHash) {
       // Back up the user's modified version
-      const backupPath = path.join(patchesDir, relPath);
+      const backupRef = resolveInstallRelativePath(patchesDir, safeRelPath);
+      if (!backupRef) continue;
+      const backupPath = backupRef.fullPath;
       fs.mkdirSync(path.dirname(backupPath), { recursive: true });
       fs.copyFileSync(fullPath, backupPath);
-      modified.push(relPath);
+      modified.push(safeRelPath);
+      pristineHashes[safeRelPath] = originalHash;
     }
   }
 
@@ -7438,7 +7449,7 @@ function saveLocalPatches(configDir, pristineCtx) {
     // Record the original (pristine) hash for each modified file
     // This lets the reapply workflow verify reconstructed pristine files
     for (const relPath of modified) {
-      meta.pristine_hashes[relPath] = manifest.files[relPath];
+      meta.pristine_hashes[relPath] = pristineHashes[relPath];
     }
     fs.writeFileSync(path.join(patchesDir, 'backup-meta.json'), JSON.stringify(meta, null, 2));
     console.log('  ' + yellow + 'i' + reset + '  Found ' + modified.length + ' locally modified GSD file(s) — backed up to ' + PATCHES_DIR_NAME + '/');
@@ -7515,7 +7526,18 @@ function reportLocalPatches(configDir, runtime = 'claude') {
   return meta.files || [];
 }
 
-function install(isGlobal, runtime = 'claude') {
+function reportInstallerMigrationResult(result) {
+  const summary = summarizeInstallerMigrationResult(result);
+  if (!summary.hasReportableActions) return;
+
+  console.log(`  ${green}✓${reset} Installer migrations`);
+  for (const row of summary.rows) {
+    const reason = row.reason ? ` — ${row.reason}` : '';
+    console.log(`     ${row.label} ${dim}${row.relPath}${reset}${reason}`);
+  }
+}
+
+function install(isGlobal, runtime = 'claude', options = {}) {
   const isOpencode = runtime === 'opencode';
   const isGemini = runtime === 'gemini';
   const isKilo = runtime === 'kilo';
@@ -7586,6 +7608,13 @@ function install(isGlobal, runtime = 'claude') {
 
   // Track installation failures
   const failures = [];
+  let installerMigrationResult = null;
+  const rollbackInstallerMigrations = () => {
+    if (!installerMigrationResult || typeof installerMigrationResult.rollback !== 'function') return;
+    const rollback = installerMigrationResult.rollback;
+    installerMigrationResult = null;
+    rollback();
+  };
 
   // Save any locally modified GSD files before they get wiped.
   // The pristine context lets saveLocalPatches populate gsd-pristine/ via
@@ -7598,8 +7627,8 @@ function install(isGlobal, runtime = 'claude') {
     isGlobal,
   });
 
-  // Clean up orphaned files from previous versions
-  cleanupOrphanedFiles(targetDir);
+  // Run manifest-backed cleanup migrations before package materialization.
+  installerMigrationResult = runInstallerMigrations({ configDir: targetDir });
 
   // #3245 — Codex idempotent rollback. Capture pre-install state of ALL
   // directories and files GSD will mutate so that any post-install validation
@@ -7686,6 +7715,7 @@ function install(isGlobal, runtime = 'claude') {
   // The full restoreCodexSnapshot() (defined inside the config block) additionally
   // handles config.toml, which is not yet touched at this point in the pipeline.
   const _codexPreConfigRollback = !isCodex || isMinimalMode(installMode) ? null : () => {
+    rollbackInstallerMigrations();
     // skills/gsd-* — pass 1: restore snapshot entries (may be absent if deleted mid-install).
     const _earlySkillsDir = path.join(targetDir, 'skills');
     for (const skillName of codexPreInstallSkillNames) {
@@ -7762,6 +7792,14 @@ function install(isGlobal, runtime = 'claude') {
     _earlyCleanTmpFiles(targetDir);
   };
 
+  // Run manifest-backed cleanup migrations after rollback snapshots exist and
+  // before package materialization. Codex rollback paths invoke the migration
+  // rollback handle if a later install step fails.
+  //
+  // Runtime scope comes from docs/installer-migrations.md#runtime-configuration-contract-registry:
+  // every supported runtime uses this same planner/apply/report path, while
+  // individual migration records decide whether a runtime-specific config
+  // rewrite is allowed by that runtime's documented ownership boundary.
   // #3245 CR finding 2 — wrap the pre-config install operations in a try/catch so
   // that ANY throw between snapshot capture and the Codex config block triggers rollback.
   // Non-Codex paths are unaffected (_codexPreConfigRollback is null for them).
@@ -7770,6 +7808,15 @@ function install(isGlobal, runtime = 'claude') {
   // Codex config block below also references it, and that block is outside the try scope.
   let agentsSrc = path.join(src, 'agents');
   try {
+  installerMigrationResult = runInstallerMigrations({
+    configDir: targetDir,
+    runtime,
+    scope: isGlobal ? 'global' : 'local',
+    migrations: options.installerMigrations,
+    baselineScan: true,
+  });
+  reportInstallerMigrationResult(installerMigrationResult);
+  assertInstallerMigrationsUnblocked(installerMigrationResult);
 
   // OpenCode/Kilo use command/ (flat), Codex uses skills/, Claude/Gemini use commands/gsd/
   if (isOpencode || isKilo) {
@@ -8388,9 +8435,16 @@ function install(isGlobal, runtime = 'claude') {
   }
 
   } catch (_earlyInstallErr) {
+    // Installer Migration Module Phase 4: docs/installer-migrations.md
+    // requires safe migrations to run before package materialization without
+    // leaving stale state behind when materialization fails. Roll migration
+    // actions back for every runtime; Codex then layers its broader runtime
+    // snapshot rollback on top.
+    rollbackInstallerMigrations();
     // #3245 CR finding 2 — any throw in the pre-config install operations (skills copy,
     // agents copy, VERSION write, manifest write, etc.) triggers the Codex pre-config
     // rollback so the caller is never left in a partially-installed state.
+    rollbackInstallerMigrations();
     if (_codexPreConfigRollback) {
       _codexPreConfigRollback();
     }
@@ -8423,6 +8477,7 @@ function install(isGlobal, runtime = 'claude') {
     // existence checks. Safe to call before any snapshots are captured (variables
     // default to empty Set / null). Does NOT touch non-gsd-* user content.
     const restoreCodexSnapshot = () => {
+      rollbackInstallerMigrations();
       // 1. config.toml
       if (codexConfigPreInstallSnapshot !== null) {
         try { fs.writeFileSync(codexConfigPathPreInstall, codexConfigPreInstallSnapshot); }
@@ -8686,10 +8741,6 @@ function install(isGlobal, runtime = 'claude') {
         throw wrapped;
       }
       console.log(`  ${green}✓${reset} Configured Codex hooks (SessionStart)`);
-      const legacyHooksCleanup = cleanupLegacyCodexHooksJson(targetDir);
-      if (legacyHooksCleanup.changed) {
-        console.log(`  ${green}✓${reset} Removed legacy GSD hooks.json entries`);
-      }
     } catch (e) {
       // #2760 — schema-validation and write failures must be loud and fatal
       // so the user is never left with a config Codex refuses to load (or no
@@ -9046,7 +9097,7 @@ function install(isGlobal, runtime = 'claude') {
     // omitted the file (as happened in v1.32.0, bug #1817), registering a missing hook
     // causes a hook error on every Bash tool invocation.
     const validateCommitFile = path.join(targetDir, 'hooks', 'gsd-validate-commit.sh');
-    if (!hasValidateCommitHook && fs.existsSync(validateCommitFile)) {
+    if (!hasValidateCommitHook && fs.existsSync(validateCommitFile) && validateCommitCommand) {
       settings.hooks[preToolEvent].push({
         matcher: 'Bash',
         hooks: [
@@ -9060,6 +9111,8 @@ function install(isGlobal, runtime = 'claude') {
       console.log(`  ${green}✓${reset} Configured commit validation hook (opt-in via config)`);
     } else if (!hasValidateCommitHook && !fs.existsSync(validateCommitFile)) {
       console.warn(`  ${yellow}⚠${reset}  Skipped commit validation hook — gsd-validate-commit.sh not found at target`);
+    } else if (!hasValidateCommitHook && !validateCommitCommand) {
+      console.warn(`  ${yellow}⚠${reset}  Skipped commit validation hook — Bash executable path unavailable (#3393)`);
     }
 
     // Configure session state orientation hook (opt-in)
@@ -9070,7 +9123,7 @@ function install(isGlobal, runtime = 'claude') {
       entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-session-state'))
     );
     const sessionStateFile = path.join(targetDir, 'hooks', 'gsd-session-state.sh');
-    if (!hasSessionStateHook && fs.existsSync(sessionStateFile)) {
+    if (!hasSessionStateHook && fs.existsSync(sessionStateFile) && sessionStateCommand) {
       settings.hooks.SessionStart.push({
         hooks: [
           {
@@ -9082,6 +9135,8 @@ function install(isGlobal, runtime = 'claude') {
       console.log(`  ${green}✓${reset} Configured session state orientation hook (opt-in via config)`);
     } else if (!hasSessionStateHook && !fs.existsSync(sessionStateFile)) {
       console.warn(`  ${yellow}⚠${reset}  Skipped session state hook — gsd-session-state.sh not found at target`);
+    } else if (!hasSessionStateHook && !sessionStateCommand) {
+      console.warn(`  ${yellow}⚠${reset}  Skipped session state hook — Bash executable path unavailable (#3393)`);
     }
 
     // Configure phase boundary detection hook (opt-in)
@@ -9092,7 +9147,7 @@ function install(isGlobal, runtime = 'claude') {
       entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-phase-boundary'))
     );
     const phaseBoundaryFile = path.join(targetDir, 'hooks', 'gsd-phase-boundary.sh');
-    if (!hasPhaseBoundaryHook && fs.existsSync(phaseBoundaryFile)) {
+    if (!hasPhaseBoundaryHook && fs.existsSync(phaseBoundaryFile) && phaseBoundaryCommand) {
       settings.hooks[postToolEvent].push({
         matcher: 'Write|Edit',
         hooks: [
@@ -9106,6 +9161,8 @@ function install(isGlobal, runtime = 'claude') {
       console.log(`  ${green}✓${reset} Configured phase boundary detection hook (opt-in via config)`);
     } else if (!hasPhaseBoundaryHook && !fs.existsSync(phaseBoundaryFile)) {
       console.warn(`  ${yellow}⚠${reset}  Skipped phase boundary hook — gsd-phase-boundary.sh not found at target`);
+    } else if (!hasPhaseBoundaryHook && !phaseBoundaryCommand) {
+      console.warn(`  ${yellow}⚠${reset}  Skipped phase boundary hook — Bash executable path unavailable (#3393)`);
     }
   }
 
@@ -9126,6 +9183,7 @@ function install(isGlobal, runtime = 'claude') {
     updateBannerCommand,
     runtime,
     configDir: targetDir,
+    rollbackInstallerMigrations,
   };
 }
 
@@ -9903,6 +9961,12 @@ function installSdkIfNeeded(opts) {
   if (!fs.existsSync(sdkCliPath)) {
     const ir = buildSdkFailFastReport(sdkDir, sdkCliPath);
     renderSdkFailFastReport(ir);
+    if (opts.throwOnFailure) {
+      const error = new Error(`GSD SDK prebuilt artifact missing: ${sdkCliPath}`);
+      error.code = 'GSD_SDK_MISSING_DIST';
+      error.exitCode = 1;
+      throw error;
+    }
     process.exit(1);
   }
 
@@ -10587,40 +10651,74 @@ function trySelfLinkGsdSdkWindows(shimSrc) {
  */
 function installAllRuntimes(runtimes, isGlobal, isInteractive) {
   const results = [];
+  const installerMigrations = discoverInstallerMigrations({
+    migrationsDir: path.join(_gsdLibDir, 'installer-migrations'),
+  });
 
-  for (const runtime of runtimes) {
-    const result = install(isGlobal, runtime);
-    results.push(result);
+  const rollbackFinalizedInstallerMigrations = (error) => {
+    const rollbackFailures = [];
+    for (const result of [...results].reverse()) {
+      if (!result || typeof result.rollbackInstallerMigrations !== 'function') continue;
+      try {
+        result.rollbackInstallerMigrations();
+      } catch (rollbackError) {
+        rollbackFailures.push({
+          runtime: result.runtime,
+          error: rollbackError.message,
+        });
+      }
+    }
+    if (rollbackFailures.length > 0) {
+      error.installerMigrationRollbackFailures = rollbackFailures;
+    }
+  };
+
+  try {
+    for (const runtime of runtimes) {
+      const result = install(isGlobal, runtime, { installerMigrations });
+      results.push(result);
+    }
+  } catch (error) {
+    rollbackFinalizedInstallerMigrations(error);
+    throw error;
   }
 
   const statuslineRuntimes = ['claude', 'gemini'];
   const primaryStatuslineResult = results.find(r => statuslineRuntimes.includes(r.runtime));
 
   const finalize = (shouldInstallStatusline, shouldInstallBanner) => {
-    // Verify sdk/dist/cli.js is present and executable. The dist is shipped
-    // prebuilt in the tarball (fix/2441-sdk-decouple); gsd-sdk reaches users via
-    // the parent package's bin/gsd-sdk.js shim, so no sub-install is needed.
-    // Skip with --no-sdk. Skip with isLocal (#2678 — local installs don't own global npm).
-    // #3033: pass forceSdk so --sdk overrides the local-install skip.
-    installSdkIfNeeded({ isLocal: !isGlobal, forceSdk: hasSdk });
+    try {
+      // Verify sdk/dist/cli.js is present and executable. The dist is shipped
+      // prebuilt in the tarball (fix/2441-sdk-decouple); gsd-sdk reaches users via
+      // the parent package's bin/gsd-sdk.js shim, so no sub-install is needed.
+      // Skip with --no-sdk. Skip with isLocal (#2678 — local installs don't own global npm).
+      // #3033: pass forceSdk so --sdk overrides the local-install skip.
+      installSdkIfNeeded({ isLocal: !isGlobal, forceSdk: hasSdk, throwOnFailure: true });
 
-    const printSummaries = () => {
-      for (const result of results) {
-        const useStatusline = statuslineRuntimes.includes(result.runtime) && shouldInstallStatusline;
-        finishInstall(
-          result.settingsPath,
-          result.settings,
-          result.statuslineCommand,
-          useStatusline,
-          result.runtime,
-          isGlobal,
-          result.configDir,
-          { shouldInstallBanner: !!shouldInstallBanner, bannerCommand: result.updateBannerCommand }
-        );
-      }
-    };
+      const printSummaries = () => {
+        for (const result of results) {
+          const useStatusline = statuslineRuntimes.includes(result.runtime) && shouldInstallStatusline;
+          finishInstall(
+            result.settingsPath,
+            result.settings,
+            result.statuslineCommand,
+            useStatusline,
+            result.runtime,
+            isGlobal,
+            result.configDir,
+            { shouldInstallBanner: !!shouldInstallBanner, bannerCommand: result.updateBannerCommand }
+          );
+        }
+      };
 
-    printSummaries();
+      printSummaries();
+    } catch (error) {
+      // Phase 4 install/update integration requires safe migrations to roll
+      // back when later package/finalization materialization fails:
+      // docs/installer-migrations.md#phase-4-installupdate-integration.
+      rollbackFinalizedInstallerMigrations(error);
+      throw error;
+    }
   };
 
   // Statusline first; if it won't actually be installed (declined, or local
@@ -10695,6 +10793,7 @@ if (process.env.GSD_TEST_MODE) {
     readGsdRuntimeProfileResolver,
     readGsdEffectiveModelOverrides,
     install,
+    installAllRuntimes,
     uninstall,
     installSdkIfNeeded,
     buildSdkFailFastReport,
@@ -10749,6 +10848,7 @@ if (process.env.GSD_TEST_MODE) {
     convertClaudeToCliineMarkdown,
     convertClaudeAgentToClineAgent,
     writeManifest,
+    saveLocalPatches,
     reportLocalPatches,
     validateHookFields,
     preserveUserArtifacts,
@@ -10781,7 +10881,6 @@ if (process.env.GSD_TEST_MODE) {
     rewriteLegacyManagedNodeHookCommands,
     buildCodexHookBlock,
     rewriteLegacyCodexHookBlock,
-    cleanupLegacyCodexHooksJson,
   };
 } else {
 
