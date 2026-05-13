@@ -6,8 +6,18 @@ const os = require('os');
 const readline = require('readline');
 const crypto = require('crypto');
 const {
-  formatHookCommandForRuntime: formatHookCommandForShell,
-  formatManagedHookScriptToken,
+  buildWindowsShimTriple: buildWindowsShimTripleFromProjection,
+  formatSdkPathDiagnostic: formatSdkPathDiagnosticFromProjection,
+  isManagedHookBasename,
+  isManagedHookCommand,
+  projectLocalHookPrefix,
+  projectLegacySettingsHookCommand,
+  projectManagedHookCommand,
+  projectPathActionProjection,
+  projectPortableHookBaseDir,
+  projectPersistentPathExportActions,
+  projectShellCommandText,
+  projectCodexHookTomlCommand,
 } = require('../get-shit-done/bin/lib/shell-command-projection.cjs');
 
 // Colors
@@ -633,16 +643,6 @@ function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts) {
   if (!settings || !settings.hooks || !absoluteRunner) return false;
   if (!opts) opts = {};
   const platform = opts.platform || process.platform;
-  const MANAGED_HOOK_FILES = new Set([
-    'gsd-check-update.js',
-    'gsd-statusline.js',
-    'gsd-context-monitor.js',
-    'gsd-prompt-guard.js',
-    'gsd-read-guard.js',
-    'gsd-read-injection-scanner.js',
-    'gsd-update-banner.js',
-    'gsd-workflow-guard.js',
-  ]);
   let changed = false;
   for (const entries of Object.values(settings.hooks)) {
     if (!Array.isArray(entries)) continue;
@@ -695,11 +695,16 @@ function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts) {
         // Take the basename — match against MANAGED_HOOK_FILES by exact
         // equality, not substring containment. Handles both forward and
         // backslash separators (Windows).
-        const scriptBase = scriptPath.split(/[\\/]/).pop() || '';
-        if (!MANAGED_HOOK_FILES.has(scriptBase)) continue;
+        if (!isManagedHookBasename(scriptPath, { surface: 'settings-json' })) continue;
 
-        const safeScriptToken = formatManagedHookScriptToken(scriptPath, opts) || scriptToken;
-        const projectedCommand = formatHookCommandForShell(`${absoluteRunner} ${safeScriptToken}`, opts);
+        const projectedCommand = projectLegacySettingsHookCommand({
+          absoluteRunner,
+          scriptPath,
+          scriptToken,
+          runtime: opts.runtime || 'generic',
+          platform,
+        });
+        if (!projectedCommand) continue;
 
         // Skip only when the existing managed command already matches the
         // desired runtime-aware projected shape. This preserves Gemini's
@@ -714,15 +719,6 @@ function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts) {
   }
   return changed;
 }
-
-/**
- * Codex managed-hook filenames eligible for legacy-bare-node migration.
- * Mirrors the settings.json allowlist in rewriteLegacyManagedNodeHookCommands.
- * Centralized so the codex toml branch and the settings.json branch can't drift.
- */
-const CODEX_MANAGED_HOOK_BASENAMES = new Set([
-  'gsd-check-update.js',
-]);
 
 /**
  * Build the GSD-managed Codex SessionStart hook block for config.toml.
@@ -750,19 +746,19 @@ function buildCodexHookBlock(targetDir, opts) {
   const absoluteRunner = opts && opts.absoluteRunner;
   if (!absoluteRunner) return null;
   const eol = (opts && opts.eol) || '\n';
-  const updateCheckScript = path.resolve(targetDir, 'hooks', 'gsd-check-update.js').replace(/\\/g, '/');
-  // toml requires escaped interior quotes (\"). The runner is already a
-  // JSON-stringified token (with literal " around the absolute path); we
-  // need to escape those quotes so the toml parser sees them as part of
-  // the string value, not as the closing quote of the command field.
-  const runnerEscaped = absoluteRunner.replace(/"/g, '\\"');
-  const hookPathEscaped = updateCheckScript.replace(/"/g, '\\"');
+  const platform = (opts && opts.platform) || process.platform;
+  const updateCheckScript = path.resolve(targetDir, 'hooks', 'gsd-check-update.js');
+  const commandValue = projectCodexHookTomlCommand({
+    absoluteRunner,
+    scriptPath: updateCheckScript,
+    platform,
+  });
   return `${eol}# GSD Hooks${eol}` +
     `[[hooks.SessionStart]]${eol}` +
     `${eol}` +
     `[[hooks.SessionStart.hooks]]${eol}` +
     `type = "command"${eol}` +
-    `command = "${runnerEscaped} \\"${hookPathEscaped}\\""${eol}`;
+    `command = "${commandValue}"${eol}`;
 }
 
 /**
@@ -778,8 +774,9 @@ function buildCodexHookBlock(targetDir, opts) {
  * @param {string|null} absoluteRunner - Result of resolveNodeRunner().
  * @returns {{ content: string, changed: boolean }}
  */
-function rewriteLegacyCodexHookBlock(content, absoluteRunner) {
+function rewriteLegacyCodexHookBlock(content, absoluteRunner, opts) {
   if (!content || !absoluteRunner) return { content, changed: false };
+  const platform = (opts && opts.platform) || process.platform;
   let changed = false;
   // Match `command = "node <scriptToken>"` lines where scriptToken is
   // either an unquoted path (no spaces) or a toml-escaped quoted path.
@@ -794,16 +791,26 @@ function rewriteLegacyCodexHookBlock(content, absoluteRunner) {
     /^(command\s*=\s*")node\s+((?:\\"[^"]+\\"|\S+))("\s*)$/gm,
     (full, prefix, scriptToken, suffix) => {
       // Extract the underlying script path from the captured token —
-      // either the bare token or the inner content of \"...\".
-      const quoted = scriptToken.match(/^\\"(.+)\\"$/);
-      const scriptPath = quoted ? quoted[1] : scriptToken;
-      const base = scriptPath.split(/[\\/]/).pop() || '';
-      if (!CODEX_MANAGED_HOOK_BASENAMES.has(base)) return full;
+      // either the bare token or the decoded inner content of \"...\".
+      const quoted = scriptToken.match(/^\\"([\s\S]+)\\"$/);
+      let scriptPath = scriptToken;
+      if (quoted) {
+        try {
+          scriptPath = String(parseTomlValue(`"${quoted[1]}"`, 0).value);
+        } catch {
+          scriptPath = quoted[1];
+        }
+      }
+      if (!isManagedHookBasename(scriptPath, { surface: 'codex-toml' })) return full;
+      const desiredCommand = projectCodexHookTomlCommand({
+        absoluteRunner,
+        scriptPath,
+        platform,
+      });
+      const currentCommand = `${prefix}${scriptToken}${suffix}`.replace(/^(command\s*=\s*")|("\s*)$/g, '');
+      if (currentCommand === desiredCommand) return full;
       changed = true;
-      const runnerEscaped = absoluteRunner.replace(/"/g, '\\"');
-      // Always re-quote the path on output for consistency with the new
-      // builder's shape.
-      return `${prefix}${runnerEscaped} \\"${scriptPath}\\"${suffix}`;
+      return `${prefix}${desiredCommand}${suffix}`;
     },
   );
   return { content: updated, changed };
@@ -840,19 +847,26 @@ function buildHookCommand(configDir, hookName, opts) {
   if (runner === null) return null;
 
   if (opts.portableHooks) {
-    // Replace the home directory prefix with $HOME so the path works when
-    // ~/.claude is bind-mounted into a container at a different absolute path.
-    const home = os.homedir().replace(/\\/g, '/');
-    const normalized = configDir.replace(/\\/g, '/');
-    const relative = normalized.startsWith(home)
-      ? '$HOME' + normalized.slice(home.length)
-      : normalized;
-    return formatHookCommandForShell(`${runner} "${relative}/hooks/${hookName}"`, opts);
+    const portableBaseDir = projectPortableHookBaseDir({
+      configDir,
+      homeDir: os.homedir(),
+    });
+    return projectManagedHookCommand({
+      absoluteRunner: runner,
+      scriptPath: `${portableBaseDir}/hooks/${hookName}`,
+      runtime: opts.runtime || 'generic',
+      platform: opts.platform || process.platform,
+    });
   }
 
   // Default: absolute path with forward slashes (Windows-safe, fixes #2045/#2046).
   const hooksPath = configDir.replace(/\\/g, '/') + '/hooks/' + hookName;
-  return formatHookCommandForShell(`${runner} "${hooksPath}"`, opts);
+  return projectManagedHookCommand({
+    absoluteRunner: runner,
+    scriptPath: hooksPath,
+    runtime: opts.runtime || 'generic',
+    platform: opts.platform || process.platform,
+  });
 }
 
 /**
@@ -3264,14 +3278,6 @@ function stripLeakedGsdCodexSections(content) {
  * Pure function, exported for test coverage. Returns the input unchanged
  * if no GSD-managed hook section is present.
  */
-// Legacy hook command basenames to detect during strip. Template-literal
-// form so install-hooks-copy.test.cjs's quoted-literal guard continues to
-// catch accidental regressions where someone *registers* the inverted
-// `gsd-update-check.js` filename in a Codex hook command.
-const STALE_HOOK_BASENAMES = new Set([
-  `gsd-update-check.js`,
-  `gsd-check-update.js`,
-]);
 function stripStaleGsdHookBlocks(configContent) {
   const sections = getTomlTableSections(configContent);
   const lineRecords = getTomlLineRecords(configContent);
@@ -3307,10 +3313,10 @@ function stripStaleGsdHookBlocks(configContent) {
         continue;
       }
       if (typeof parsed.value !== 'string') continue;
-      // Match the basename — Codex configs reference these files by absolute
-      // path under the user's `.codex/hooks/` directory.
-      const basename = parsed.value.split(/[\\/]/).pop() || '';
-      if (STALE_HOOK_BASENAMES.has(basename)) {
+      if (isManagedHookCommand(parsed.value, {
+        surface: 'codex-toml',
+        includeLegacyAliases: true,
+      })) {
         return true;
       }
     }
@@ -6706,22 +6712,19 @@ function uninstall(isGlobal, runtime = 'claude') {
 
     // Remove GSD hooks from settings — per-hook granularity to preserve
     // user hooks that share an entry with a GSD hook (#1755 followup)
-    const isGsdHookCommand = (cmd) =>
-      cmd && (cmd.includes('gsd-check-update') || cmd.includes('gsd-statusline') ||
-        cmd.includes('gsd-session-state') || cmd.includes('gsd-context-monitor') ||
-        cmd.includes('gsd-phase-boundary') || cmd.includes('gsd-prompt-guard') ||
-        cmd.includes('gsd-read-guard') || cmd.includes('gsd-read-injection-scanner') ||
-        cmd.includes('gsd-update-banner') ||
-        cmd.includes('gsd-validate-commit') || cmd.includes('gsd-workflow-guard'));
-
     for (const eventName of ['SessionStart', 'PostToolUse', 'AfterTool', 'PreToolUse', 'BeforeTool']) {
       if (settings.hooks && settings.hooks[eventName]) {
         const before = JSON.stringify(settings.hooks[eventName]);
         settings.hooks[eventName] = settings.hooks[eventName]
           .map(entry => {
-            if (!entry.hooks || !Array.isArray(entry.hooks)) return entry;
+            if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) return entry;
             // Filter out individual GSD hooks, keep user hooks
-            entry.hooks = entry.hooks.filter(h => !isGsdHookCommand(h.command));
+            entry.hooks = entry.hooks.filter((h) => {
+              if (!h || typeof h.command !== 'string') return true;
+              return !isManagedHookCommand(h.command, {
+                surface: 'settings-json',
+              });
+            });
             return entry.hooks.length > 0 ? entry : null;
           })
           .filter(Boolean);
@@ -8838,21 +8841,33 @@ function install(isGlobal, runtime = 'claude', options = {}) {
   // Claude Code sets $CLAUDE_PROJECT_DIR; Gemini/Antigravity do not — and on
   // Windows their own substitution logic doubles the path (#2557). Those runtimes
   // run project hooks with the project dir as cwd, so bare relative paths work.
-  const localPrefix = (runtime === 'gemini' || runtime === 'antigravity')
-    ? dirName
-    : '"$CLAUDE_PROJECT_DIR"/' + dirName;
+  const localPrefix = projectLocalHookPrefix({ runtime, dirName });
   const hookOpts = { portableHooks: hasPortableHooks, runtime };
   // #2979: local-install hook commands also use the absolute node path so
   // GUI/minimal-PATH runtimes can resolve them. Bare `node` fails when the
   // host launches the runtime with a stripped PATH (Finder/Antigravity/etc).
   const localNodeRunner = resolveNodeRunner();
+  const localBashRunner = resolveBashRunner({ platform: process.platform });
   // If we cannot resolve an absolute node path AND this is a local install,
   // skip managed-hook registration. Returning null from buildHookCommand on
   // global installs has the same effect. Better to skip than to emit a bare
   // `node` command that recreates the #2979 failure.
   const localCmd = (hookFile) => localNodeRunner === null
     ? null
-    : formatHookCommandForShell(localNodeRunner + ' ' + localPrefix + '/hooks/' + hookFile, hookOpts);
+    : projectShellCommandText({
+      runnerToken: localNodeRunner,
+      argTokens: [`${localPrefix}/hooks/${hookFile}`],
+      runtime,
+      platform: process.platform,
+    });
+  const localShellCmd = (hookFile) => localBashRunner === null
+    ? null
+    : projectShellCommandText({
+      runnerToken: localBashRunner,
+      argTokens: [`${localPrefix}/hooks/${hookFile}`],
+      runtime,
+      platform: process.platform,
+    });
   const statuslineCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-statusline.js', hookOpts)
     : localCmd('gsd-statusline.js');
@@ -9087,7 +9102,7 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     // Configure commit validation hook (Conventional Commits enforcement, opt-in)
     const validateCommitCommand = isGlobal
       ? buildHookCommand(targetDir, 'gsd-validate-commit.sh', hookOpts)
-      : 'bash ' + localPrefix + '/hooks/gsd-validate-commit.sh';
+      : localShellCmd('gsd-validate-commit.sh');
     const hasValidateCommitHook = settings.hooks[preToolEvent].some(entry =>
       entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-validate-commit'))
     );
@@ -9116,7 +9131,7 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     // Configure session state orientation hook (opt-in)
     const sessionStateCommand = isGlobal
       ? buildHookCommand(targetDir, 'gsd-session-state.sh', hookOpts)
-      : 'bash ' + localPrefix + '/hooks/gsd-session-state.sh';
+      : localShellCmd('gsd-session-state.sh');
     const hasSessionStateHook = settings.hooks.SessionStart.some(entry =>
       entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-session-state'))
     );
@@ -9140,7 +9155,7 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     // Configure phase boundary detection hook (opt-in)
     const phaseBoundaryCommand = isGlobal
       ? buildHookCommand(targetDir, 'gsd-phase-boundary.sh', hookOpts)
-      : 'bash ' + localPrefix + '/hooks/gsd-phase-boundary.sh';
+      : localShellCmd('gsd-phase-boundary.sh');
     const hasPhaseBoundaryHook = settings.hooks[postToolEvent].some(entry =>
       entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-phase-boundary'))
     );
@@ -9733,7 +9748,8 @@ function homePathCoveredByRc(globalBin, homeDir, rcFileNames) {
  *   - a diagnostic "already covered via rc file" note, if an rc file has
  *     `export PATH="$HOME/…/bin:$PATH"` (or equivalent) and the user just
  *     needs to reopen their shell
- *   - the absolute `echo 'export PATH="…:$PATH"' >> ~/.zshrc` suggestion,
+ *   - projected shell actions that append `export PATH="…:$PATH"` to
+ *     `~/.zshrc` / `~/.bashrc` when neither PATH nor rc files cover globalBin
  *     if neither PATH nor any rc file covers globalBin
  *
  * Exported for tests; the installer calls this from finishInstall.
@@ -9762,8 +9778,14 @@ function maybeSuggestPathExport(globalBin, homeDir) {
   console.log('');
   console.log(`  ${yellow}⚠${reset} ${bold}${globalBin}${reset} is not on your PATH.`);
   console.log(`    Add it with one of:`);
-  console.log(`      ${cyan}echo 'export PATH="${globalBin}:$PATH"' >> ~/.zshrc${reset}`);
-  console.log(`      ${cyan}echo 'export PATH="${globalBin}:$PATH"' >> ~/.bashrc${reset}`);
+  const projected = projectPersistentPathExportActions({
+    targetDir: globalBin,
+    platform: process.platform,
+  });
+  for (const action of projected.shellActions) {
+    const labelPrefix = action.label ? `${action.label}: ` : '';
+    console.log(`      ${cyan}${labelPrefix}${action.command}${reset}`);
+  }
   console.log('');
 }
 
@@ -10483,32 +10505,7 @@ function trySelfLinkGsdSdk(shimSrc) {
  * over rendered shim text.
  */
 function buildWindowsShimTriple(shimSrc) {
-  const path = require('path');
-  const shimAbs = path.resolve(shimSrc);
-  // JSON.stringify produces a double-quoted string with backslash+quote
-  // escaping — the safe quoting form for cmd.exe and PowerShell paths alike.
-  const shimQuoted = JSON.stringify(shimAbs);
-
-  const invocation = {
-    interpreter: 'node',
-    target: shimAbs,
-  };
-
-  // Renderers are template literals — the only place text is constructed.
-  // Tests do not parse these strings; they assert on the typed fields above.
-  const renderCmd = () =>
-    '@ECHO OFF\r\n@SETLOCAL\r\n@node ' + shimQuoted + ' %*\r\n';
-  const renderPs1 = () =>
-    '#!/usr/bin/env pwsh\n& node ' + shimQuoted + ' $args\nexit $LASTEXITCODE\n';
-  const renderSh = () =>
-    '#!/usr/bin/env sh\nexec node ' + shimQuoted + ' "$@"\n';
-
-  return {
-    invocation,
-    eol: { cmd: '\r\n', ps1: '\n', sh: '\n' },
-    fileNames: { cmd: 'gsd-sdk.cmd', ps1: 'gsd-sdk.ps1', sh: 'gsd-sdk' },
-    render: { cmd: renderCmd, ps1: renderPs1, sh: renderSh },
-  };
+  return buildWindowsShimTripleFromProjection(shimSrc);
 }
 
 /**
@@ -10528,56 +10525,7 @@ function buildWindowsShimTriple(shimSrc) {
  * console output. Pure function — no fs, no spawn, no console.
  */
 function formatSdkPathDiagnostic({ shimDir, platform, runDir }) {
-  const path = require('path');
-  const isWin32 = platform === 'win32';
-  // Detect either path separator — the test fixtures pass Windows-style
-  // paths while running on POSIX, and real users hit either depending on
-  // their npm/npx setup. Anchor on `_npx` between separators.
-  const isNpx = typeof runDir === 'string' &&
-    (runDir.includes('/_npx/') || runDir.includes('\\_npx\\'));
-
-  const shimLocationLine = shimDir ? `Shim written to: ${shimDir}` : '';
-  const actionLines = [];
-
-  if (shimDir) {
-    // Escape shimDir for each shell context. A path containing a single
-    // quote (e.g. C:\Users\O'Neil\AppData\...) would otherwise generate
-    // broken commands the user can't paste:
-    //   - PowerShell single-quoted string: '' escapes a literal single quote
-    //   - bash inside outer single quotes: '\'' (close, escaped quote, reopen)
-    //   - POSIX export inside double quotes: escape \ $ " ` so the path is
-    //     copied verbatim and $PATH (which is OUTSIDE the escaped substring)
-    //     still expands at paste time.
-    const psShimDir   = shimDir.replace(/'/g, "''");
-    const bashShimDir = shimDir.replace(/\\/g, '/').replace(/'/g, "'\\''");
-    const posixShimDir = shimDir.replace(/[\\$"`]/g, '\\$&');
-    actionLines.push('Add that directory to your PATH and restart your shell.');
-    if (isWin32) {
-      actionLines.push(`PowerShell: [Environment]::SetEnvironmentVariable('PATH', '${psShimDir};' + [Environment]::GetEnvironmentVariable('PATH', 'User'), 'User')`);
-      // setx PATH "...;%PATH%" silently truncates above 1024 chars and
-      // expands %PATH% / %SystemRoot% to literals (turning REG_EXPAND_SZ
-      // into REG_SZ), permanently breaking lazy variable references.
-      // Invoke PowerShell from cmd.exe with the same SetEnvironmentVariable
-      // call as the PowerShell line so cmd.exe users get a safe command.
-      actionLines.push(`cmd.exe   : powershell -Command "[Environment]::SetEnvironmentVariable('PATH', '${psShimDir};' + [Environment]::GetEnvironmentVariable('PATH', 'User'), 'User')"`);
-      actionLines.push(`Git Bash  : echo 'export PATH="${bashShimDir}:$PATH"' >> ~/.bashrc`);
-    } else {
-      actionLines.push(`export PATH="${posixShimDir}:$PATH"`);
-    }
-  } else {
-    actionLines.push('Could not locate a writable PATH directory to install the shim.');
-    actionLines.push('Install globally to materialize the bin symlink:');
-    actionLines.push('npm install -g get-shit-done-cc');
-  }
-
-  const npxNoteLines = isNpx
-    ? [
-        "Note: you're running via npx. For a persistent shim,",
-        'install globally instead: npm install -g get-shit-done-cc',
-      ]
-    : [];
-
-  return { shimLocationLine, actionLines, npxNoteLines, isNpx, isWin32 };
+  return formatSdkPathDiagnosticFromProjection({ shimDir, platform, runDir });
 }
 
 function trySelfLinkGsdSdkWindows(shimSrc) {
