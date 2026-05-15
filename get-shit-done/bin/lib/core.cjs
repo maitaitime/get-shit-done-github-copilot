@@ -348,6 +348,14 @@ function loadConfig(cwd, options = {}) {
       const raw = platformReadSync(rootConfigPath);
       if (raw === null) throw new Error('missing');
       rootParsed = JSON.parse(raw);
+      if (Object.prototype.hasOwnProperty.call(rootParsed, 'branching_strategy')) {
+        if (!rootParsed.git) rootParsed.git = {};
+        if (rootParsed.git.branching_strategy === undefined) {
+          rootParsed.git.branching_strategy = rootParsed.branching_strategy;
+        }
+        delete rootParsed.branching_strategy;
+        try { platformWriteSync(rootConfigPath, JSON.stringify(rootParsed, null, 2)); } catch {}
+      }
     } catch {
       // Root config missing or unparseable — workstream config stands alone
     }
@@ -399,6 +407,21 @@ function loadConfig(cwd, options = {}) {
       configDirty = true;
     }
 
+    // #3523 — Migrate legacy top-level branching_strategy → git.branching_strategy.
+    // Canonical location is git.branching_strategy (per config-schema.cjs); writing
+    // at the top level trips the unknown-key warning even though loadConfig:485 actively
+    // reads it via the nested fallback. This migration mirrors the multiRepo → sub_repos
+    // precedent: graft then delete so the warning never fires again on this project.
+    // The nested value wins if already set (matches SDK mergeDefaults precedence, PR #3116).
+    if (Object.prototype.hasOwnProperty.call(fileData, 'branching_strategy')) {
+      if (!fileData.git) fileData.git = {};
+      if (fileData.git.branching_strategy === undefined) {
+        fileData.git.branching_strategy = fileData.branching_strategy;
+      }
+      delete fileData.branching_strategy;
+      configDirty = true;
+    }
+
     // Keep planning.sub_repos in sync with actual filesystem
     const currentSubRepos = fileData.planning?.sub_repos || [];
     if (Array.isArray(currentSubRepos) && currentSubRepos.length > 0) {
@@ -439,13 +462,23 @@ function loadConfig(cwd, options = {}) {
       // Internal keys loadConfig reads but config-set doesn't expose
       'model_overrides', 'context_window', 'resolve_model_ids', 'claude_md_path',
       // Deprecated keys (still accepted for migration, not in config-set)
-      'depth', 'multiRepo',
+      // 'branching_strategy' is kept here as a safety net: it is migrated to
+      // git.branching_strategy above (#3523), but on the first read of a root
+      // config that feeds into a workstream merge, `parsed` may still surface it.
+      'depth', 'multiRepo', 'branching_strategy',
     ]);
     const unknownKeys = Object.keys(parsed).filter(k => !KNOWN_TOP_LEVEL.has(k));
     if (unknownKeys.length > 0) {
-      process.stderr.write(
-        `gsd-tools: warning: unknown config key(s) in .planning/config.json: ${unknownKeys.join(', ')} — these will be ignored\n`
-      );
+      // Deduplicate: a single `init phase-op N` invocation calls loadConfig twice
+      // (once for the sub-command setup, once for git-config resolution). Guard with
+      // a module-level Set so the same message never fires more than once per process.
+      const warnKey = unknownKeys.join(',');
+      if (!_warnedUnknownConfigKeys.has(warnKey)) {
+        _warnedUnknownConfigKeys.add(warnKey);
+        process.stderr.write(
+          `gsd-tools: warning: unknown config key(s) in .planning/config.json: ${unknownKeys.join(', ')} — these will be ignored\n`
+        );
+      }
     }
 
     // #2517 — Validate runtime/tier values for keys that loadConfig handles but
@@ -585,6 +618,11 @@ function loadConfig(cwd, options = {}) {
 
 // ─── Git utilities ────────────────────────────────────────────────────────────
 
+// Module-level deduplication for unknown-key warnings (#3523).
+// A single `init phase-op N` call invokes loadConfig more than once; this Set
+// prevents the same warning from being echoed on each invocation.
+const _warnedUnknownConfigKeys = new Set();
+
 const _gitIgnoredCache = new Map();
 
 function isGitIgnored(cwd, targetPath) {
@@ -686,6 +724,31 @@ function normalizePhaseName(phase) {
   }
   // Custom phase IDs (e.g. PROJ-42, AUTH-101): return as-is
   return str;
+}
+
+/**
+ * Render a regex source fragment matching a phase number against ROADMAP/STATE
+ * prose regardless of zero-padding on either side. Skills pass the resolved
+ * padded form (`02.7`), but human-authored ROADMAP prose is conventionally
+ * un-padded (`### Phase 2.7:`); a naive `escapeRegex(phaseNum)` fragment never
+ * matches when the two diverge. Strips leading zeros from the integer part
+ * before re-emitting with a `0*` prefix, so the fragment matches both `2.7`
+ * and `02.7` (and `002.7`).
+ *
+ * Falls back to `escapeRegex(phaseNum)` for non-numeric IDs (custom project
+ * codes like `PROJ-42`) so callers can substitute it unconditionally.
+ *
+ * See #3537 — wired into every ROADMAP-prose regex builder.
+ */
+function phaseMarkdownRegexSource(phaseNum) {
+  const stripped = String(phaseNum).replace(/^[A-Z]{1,6}-(?=\d)/i, '');
+  const match = stripped.match(/^0*(\d+)([A-Z])?((?:\.\d+)*)$/i);
+  if (!match) return escapeRegex(phaseNum);
+
+  const integer = match[1].replace(/^0+/, '') || '0';
+  const letter = match[2] ? escapeRegex(match[2]) : '';
+  const decimal = match[3] ? escapeRegex(match[3]) : '';
+  return `0*${escapeRegex(integer)}${letter}${decimal}`;
 }
 
 function comparePhaseNum(a, b) {
@@ -1033,19 +1096,13 @@ function getRoadmapPhaseInternal(cwd, phaseNum) {
     const roadmapRaw = platformReadSync(roadmapPath);
     if (roadmapRaw === null) throw new Error('missing');
     const content = extractCurrentMilestone(roadmapRaw, cwd);
-    // Strip leading zeros from purely numeric phase numbers so "03" matches "Phase 3:"
-    // in canonical ROADMAP headings. Non-numeric IDs (e.g. "PROJ-42") are kept as-is.
-    const normalized = /^\d+$/.test(String(phaseNum))
-      ? String(phaseNum).replace(/^0+(?=\d)/, '')
-      : String(phaseNum);
-    const escapedPhase = escapeRegex(normalized);
-    // Match both numeric and custom (Phase PROJ-42:) headers.
-    // For purely numeric phases allow optional leading zeros so both "Phase 1:" and
-    // "Phase 01:" are matched regardless of whether the ROADMAP uses padded numbers.
-    const isNumeric = /^\d+$/.test(String(phaseNum));
-    const phasePattern = isNumeric
-      ? new RegExp(`#{2,4}\\s*Phase\\s+0*${escapedPhase}:\\s*([^\\n]+)`, 'i')
-      : new RegExp(`#{2,4}\\s*Phase\\s+${escapedPhase}:\\s*([^\\n]+)`, 'i');
+    // #3537: route through canonical padding-tolerant fragment. The prior
+    // hand-rolled `isNumeric` branch only stripped padding on integer-only
+    // ids and missed decimal padding (`02.7` against `Phase 2.7:` headings).
+    const phasePattern = new RegExp(
+      `#{2,4}\\s*Phase\\s+${phaseMarkdownRegexSource(phaseNum)}:\\s*([^\\n]+)`,
+      'i'
+    );
     const headerMatch = content.match(phasePattern);
     if (!headerMatch) return null;
 
@@ -1842,6 +1899,7 @@ module.exports = {
   isGitIgnored,
   escapeRegex,
   normalizePhaseName,
+  phaseMarkdownRegexSource,
   comparePhaseNum,
   searchPhaseInDir,
   extractPhaseToken,
