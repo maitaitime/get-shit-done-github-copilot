@@ -8061,13 +8061,21 @@ function install(isGlobal, runtime = 'claude', options = {}) {
   // #3541: non-interactive runs (typical /gsd-update via Claude Code) have
   // no stdin TTY and therefore no way to answer prompt-user migration
   // actions. Resolve safe categories by classification (stale SDK build
-  // artifacts → remove; user-facing skills → keep) and log every
-  // resolution; anything that cannot be safely defaulted falls through
-  // to assertInstallerMigrationsUnblocked, which now emits a grouped
-  // error with the documented resolution path.
+  // artifacts → remove; user-facing skills → keep; bundled GSD hooks →
+  // remove [#3610]) and log every resolution; anything that cannot be
+  // safely defaulted falls through to assertInstallerMigrationsUnblocked,
+  // which now emits a grouped error with the documented resolution path.
+  //
+  // #3610: the classifier-based resolution must run regardless of TTY.
+  // For unambiguous categories (e.g. `hooks/gsd-*` bundled hooks left
+  // behind by a previous version), there is no actual "user choice" to
+  // make — the file is a known GSD-managed artifact and the installer is
+  // about to write the fresh bundled version. Gating the resolver on
+  // `!isTTY` made `npx get-shit-done-cc@latest --codex` hard-abort with
+  // 12 blocked bundled hooks. The env-override branch (operator-supplied
+  // GSD_INSTALLER_MIGRATION_RESOLVE) still applies only in non-TTY mode.
   const _migrationIsTty = process.stdin && process.stdin.isTTY === true;
-  if (!_migrationIsTty &&
-      Array.isArray(installerMigrationResult.blocked) &&
+  if (Array.isArray(installerMigrationResult.blocked) &&
       installerMigrationResult.blocked.length > 0 &&
       installerMigrationResult.plan &&
       Array.isArray(installerMigrationResult.plan.actions)) {
@@ -8425,26 +8433,35 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     failures.push('get-shit-done');
   }
 
-  // #3288 — Copy sdk/shared/model-catalog.json into the get-shit-done payload
-  // at the co-located path that model-catalog.cjs resolves first:
-  //   get-shit-done/bin/shared/model-catalog.json
+  // #3288 / #3571 — Copy sdk/shared manifests into the get-shit-done payload
+  // at the co-located path that CJS modules resolve first:
+  //   get-shit-done/bin/shared/*.json
   //
-  // The install copies get-shit-done/ but NOT sdk/ — the CJS module's legacy
-  // path (3 levels up → sdk/shared/) therefore resolves to a non-existent
-  // location in every post-install layout.  Copying the catalog alongside the
-  // CJS files ensures require() succeeds without needing sdk/ to exist.
-  const modelCatalogSrc = path.join(src, 'sdk', 'shared', 'model-catalog.json');
-  const modelCatalogDest = path.join(skillDest, 'bin', 'shared', 'model-catalog.json');
-  if (fs.existsSync(modelCatalogSrc)) {
-    fs.mkdirSync(path.dirname(modelCatalogDest), { recursive: true });
-    fs.copyFileSync(modelCatalogSrc, modelCatalogDest);
-    if (verifyFileInstalled(modelCatalogDest, 'get-shit-done/bin/shared/model-catalog.json')) {
-      console.log(`  ${green}✓${reset} Installed get-shit-done/bin/shared/model-catalog.json`);
+  // The install copies get-shit-done/ but NOT sdk/ — CJS modules' legacy
+  // source-repo paths (3 levels up → sdk/shared/) therefore resolve to a
+  // non-existent location in every post-install layout. Copying these shared
+  // files alongside the CJS files ensures require() succeeds without needing
+  // sdk/ to exist.
+  const sharedPayloadFiles = [
+    'model-catalog.json',
+    'config-defaults.manifest.json',
+    'config-schema.manifest.json',
+  ];
+  for (const fileName of sharedPayloadFiles) {
+    const sharedSrc = path.join(src, 'sdk', 'shared', fileName);
+    const sharedDest = path.join(skillDest, 'bin', 'shared', fileName);
+    const displayPath = `get-shit-done/bin/shared/${fileName}`;
+    if (fs.existsSync(sharedSrc)) {
+      fs.mkdirSync(path.dirname(sharedDest), { recursive: true });
+      fs.copyFileSync(sharedSrc, sharedDest);
+      if (verifyFileInstalled(sharedDest, displayPath)) {
+        console.log(`  ${green}✓${reset} Installed ${displayPath}`);
+      } else {
+        failures.push(displayPath);
+      }
     } else {
-      failures.push('get-shit-done/bin/shared/model-catalog.json');
+      failures.push(`sdk/shared/${fileName} (source missing)`);
     }
-  } else {
-    failures.push('sdk/shared/model-catalog.json (source missing)');
   }
 
   // Copy agents to agents directory.
