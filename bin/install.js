@@ -6854,7 +6854,7 @@ function uninstall(isGlobal, runtime = 'claude') {
   // 4. Remove GSD hooks
   const hooksDir = path.join(targetDir, 'hooks');
   if (fs.existsSync(hooksDir)) {
-    const gsdHooks = ['gsd-statusline.js', 'gsd-check-update.js', 'gsd-context-monitor.js', 'gsd-prompt-guard.js', 'gsd-read-guard.js', 'gsd-read-injection-scanner.js', 'gsd-update-banner.js', 'gsd-workflow-guard.js', 'gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh', 'gsd-graphify-update.sh'];
+    const gsdHooks = ['gsd-statusline.js', 'gsd-check-update.js', 'gsd-context-monitor.js', 'gsd-prompt-guard.js', 'gsd-read-guard.js', 'gsd-read-injection-scanner.js', 'gsd-update-banner.js', 'gsd-workflow-guard.js', 'gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh'];
     let hookCount = 0;
     for (const hook of gsdHooks) {
       const hookPath = path.join(hooksDir, hook);
@@ -8433,35 +8433,26 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     failures.push('get-shit-done');
   }
 
-  // #3288 / #3571 — Copy sdk/shared manifests into the get-shit-done payload
-  // at the co-located path that CJS modules resolve first:
-  //   get-shit-done/bin/shared/*.json
+  // #3288 — Copy sdk/shared/model-catalog.json into the get-shit-done payload
+  // at the co-located path that model-catalog.cjs resolves first:
+  //   get-shit-done/bin/shared/model-catalog.json
   //
-  // The install copies get-shit-done/ but NOT sdk/ — CJS modules' legacy
-  // source-repo paths (3 levels up → sdk/shared/) therefore resolve to a
-  // non-existent location in every post-install layout. Copying these shared
-  // files alongside the CJS files ensures require() succeeds without needing
-  // sdk/ to exist.
-  const sharedPayloadFiles = [
-    'model-catalog.json',
-    'config-defaults.manifest.json',
-    'config-schema.manifest.json',
-  ];
-  for (const fileName of sharedPayloadFiles) {
-    const sharedSrc = path.join(src, 'sdk', 'shared', fileName);
-    const sharedDest = path.join(skillDest, 'bin', 'shared', fileName);
-    const displayPath = `get-shit-done/bin/shared/${fileName}`;
-    if (fs.existsSync(sharedSrc)) {
-      fs.mkdirSync(path.dirname(sharedDest), { recursive: true });
-      fs.copyFileSync(sharedSrc, sharedDest);
-      if (verifyFileInstalled(sharedDest, displayPath)) {
-        console.log(`  ${green}✓${reset} Installed ${displayPath}`);
-      } else {
-        failures.push(displayPath);
-      }
+  // The install copies get-shit-done/ but NOT sdk/ — the CJS module's legacy
+  // path (3 levels up → sdk/shared/) therefore resolves to a non-existent
+  // location in every post-install layout.  Copying the catalog alongside the
+  // CJS files ensures require() succeeds without needing sdk/ to exist.
+  const modelCatalogSrc = path.join(src, 'sdk', 'shared', 'model-catalog.json');
+  const modelCatalogDest = path.join(skillDest, 'bin', 'shared', 'model-catalog.json');
+  if (fs.existsSync(modelCatalogSrc)) {
+    fs.mkdirSync(path.dirname(modelCatalogDest), { recursive: true });
+    fs.copyFileSync(modelCatalogSrc, modelCatalogDest);
+    if (verifyFileInstalled(modelCatalogDest, 'get-shit-done/bin/shared/model-catalog.json')) {
+      console.log(`  ${green}✓${reset} Installed get-shit-done/bin/shared/model-catalog.json`);
     } else {
-      failures.push(`sdk/shared/${fileName} (source missing)`);
+      failures.push('get-shit-done/bin/shared/model-catalog.json');
     }
+  } else {
+    failures.push('sdk/shared/model-catalog.json (source missing)');
   }
 
   // Copy agents to agents directory.
@@ -8666,7 +8657,7 @@ function install(isGlobal, runtime = 'claude', options = {}) {
       if (verifyInstalled(hooksDest, 'hooks')) {
         console.log(`  ${green}✓${reset} Installed hooks (bundled)`);
         // Warn if expected community .sh hooks are missing (non-fatal)
-        const expectedShHooks = ['gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh', 'gsd-graphify-update.sh'];
+        const expectedShHooks = ['gsd-session-state.sh', 'gsd-validate-commit.sh', 'gsd-phase-boundary.sh'];
         for (const sh of expectedShHooks) {
           if (!fs.existsSync(path.join(hooksDest, sh))) {
             console.warn(`  ${yellow}⚠${reset}  Missing expected hook: ${sh}`);
@@ -9459,35 +9450,6 @@ function install(isGlobal, runtime = 'claude', options = {}) {
       console.warn(`  ${yellow}⚠${reset}  Skipped commit validation hook — gsd-validate-commit.sh not found at target`);
     } else if (!hasValidateCommitHook && !validateCommitCommand) {
       console.warn(`  ${yellow}⚠${reset}  Skipped commit validation hook — Bash executable path unavailable (#3393)`);
-    }
-
-    // Configure graphify auto-update hook (opt-in via graphify.auto_update; default false, #3347).
-    // PostToolUse Bash matcher — fires after git commit/merge/pull/rebase --continue/cherry-pick
-    // on the default branch, dispatches `graphify update .` in a detached subprocess. No-op unless
-    // .planning/config.json has BOTH graphify.enabled=true AND graphify.auto_update=true.
-    const graphifyUpdateCommand = isGlobal
-      ? buildHookCommand(targetDir, 'gsd-graphify-update.sh', hookOpts)
-      : localShellCmd('gsd-graphify-update.sh');
-    const hasGraphifyUpdateHook = settings.hooks[postToolEvent].some(entry =>
-      entry.hooks && entry.hooks.some(h => h.command && h.command.includes('gsd-graphify-update'))
-    );
-    const graphifyUpdateFile = path.join(targetDir, 'hooks', 'gsd-graphify-update.sh');
-    if (!hasGraphifyUpdateHook && fs.existsSync(graphifyUpdateFile) && graphifyUpdateCommand) {
-      settings.hooks[postToolEvent].push({
-        matcher: 'Bash',
-        hooks: [
-          {
-            type: 'command',
-            command: graphifyUpdateCommand,
-            timeout: 5
-          }
-        ]
-      });
-      console.log(`  ${green}✓${reset} Configured graphify auto-update hook (opt-in via graphify.auto_update)`);
-    } else if (!hasGraphifyUpdateHook && !fs.existsSync(graphifyUpdateFile)) {
-      console.warn(`  ${yellow}⚠${reset}  Skipped graphify auto-update hook — gsd-graphify-update.sh not found at target`);
-    } else if (!hasGraphifyUpdateHook && !graphifyUpdateCommand) {
-      console.warn(`  ${yellow}⚠${reset}  Skipped graphify auto-update hook — Bash executable path unavailable (#3393)`);
     }
 
     // Configure session state orientation hook (opt-in)
